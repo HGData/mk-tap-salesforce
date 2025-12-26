@@ -259,6 +259,12 @@ class Salesforce:
         # Rate limiting: track last request time to throttle requests
         self._last_request_time = 0
         self._min_request_interval = 0.1  # Minimum 100ms between requests (10 req/sec max)
+        # Track REST quota usage for this job (start and end values)
+        self._initial_quota_used = None
+        self._initial_quota_allotted = None
+        self._final_quota_used = None
+        self._final_quota_allotted = None
+        self._max_quota_used_seen = 0
 
         self.auth = SalesforceAuth.from_credentials(credentials, is_sandbox=self.is_sandbox)
 
@@ -293,20 +299,25 @@ class Salesforce:
             return []
 
     def get_api_quota_info(self):
-        """Fetch and return current API quota information from Salesforce."""
+        """Fetch and return current API quota information from Salesforce.
+        
+        Note: This endpoint requires special permissions and may return 403 Forbidden.
+        If it fails, we fall back to header-based quota tracking.
+        """
         endpoint = "limits"
         url = self.data_url.format(self.instance_url, endpoint)
 
         try:
-            resp = self._make_request("GET", url, headers=self.auth.rest_headers).json()
+            resp = self._make_request("GET", url, headers=self.auth.rest_headers)
+            quota_data = resp.json()
 
             quota_info = {}
 
             # REST API quota
-            if "DailyApiRequests" in resp:
-                rest_used = resp["DailyApiRequests"]["Max"] - resp["DailyApiRequests"]["Remaining"]
-                rest_max = resp["DailyApiRequests"]["Max"]
-                rest_remaining = resp["DailyApiRequests"]["Remaining"]
+            if "DailyApiRequests" in quota_data:
+                rest_used = quota_data["DailyApiRequests"]["Max"] - quota_data["DailyApiRequests"]["Remaining"]
+                rest_max = quota_data["DailyApiRequests"]["Max"]
+                rest_remaining = quota_data["DailyApiRequests"]["Remaining"]
                 rest_percent = (rest_used / rest_max * 100) if rest_max > 0 else 0
                 quota_info["rest"] = {
                     "used": rest_used,
@@ -314,12 +325,18 @@ class Salesforce:
                     "remaining": rest_remaining,
                     "percent_used": rest_percent,
                 }
+                
+                # Capture initial quota if not already set (from limits endpoint)
+                if self._initial_quota_used is None:
+                    self._initial_quota_used = rest_used
+                    self._initial_quota_allotted = rest_max
+                    self._max_quota_used_seen = rest_used
 
             # Bulk API quota
-            if "DailyBulkApiBatches" in resp:
-                bulk_used = resp["DailyBulkApiBatches"]["Max"] - resp["DailyBulkApiBatches"]["Remaining"]
-                bulk_max = resp["DailyBulkApiBatches"]["Max"]
-                bulk_remaining = resp["DailyBulkApiBatches"]["Remaining"]
+            if "DailyBulkApiBatches" in quota_data:
+                bulk_used = quota_data["DailyBulkApiBatches"]["Max"] - quota_data["DailyBulkApiBatches"]["Remaining"]
+                bulk_max = quota_data["DailyBulkApiBatches"]["Max"]
+                bulk_remaining = quota_data["DailyBulkApiBatches"]["Remaining"]
                 bulk_percent = (bulk_used / bulk_max * 100) if bulk_max > 0 else 0
                 quota_info["bulk"] = {
                     "used": bulk_used,
@@ -329,8 +346,16 @@ class Salesforce:
                 }
 
             return quota_info
+        except requests.exceptions.HTTPError as e:
+            # 403 Forbidden is common - user doesn't have permission to access /limits endpoint
+            # This is fine, we'll use header-based tracking instead
+            if e.response and e.response.status_code == 403:
+                LOGGER.debug("Cannot access /limits endpoint (403 Forbidden) - using header-based quota tracking instead")
+            else:
+                LOGGER.debug("Failed to fetch API quota information from /limits endpoint: %s", e)
+            return None
         except Exception as e:
-            LOGGER.warning("Failed to fetch API quota information: %s", e)
+            LOGGER.debug("Failed to fetch API quota information: %s", e)
             return None
 
     def log_api_quota(self, context="Current"):
@@ -361,6 +386,30 @@ class Salesforce:
                 bulk["percent_used"],
                 bulk["remaining"],
             )
+    
+    def log_job_quota_usage(self):
+        """Log how much API quota this job consumed from start to end."""
+        # Always show internal counter (most accurate for this job)
+        internal_count = self.rest_requests_attempted
+        
+        # Also show quota header tracking if available
+        if self._initial_quota_used is not None and self._final_quota_used is not None:
+            quota_used_by_job = self._final_quota_used - self._initial_quota_used
+            LOGGER.info(
+                "This job used %d REST API requests (internal count: %d, system-wide quota change: %d from %d to %d out of %d total)",
+                internal_count,
+                internal_count,
+                quota_used_by_job,
+                self._initial_quota_used,
+                self._final_quota_used,
+                self._final_quota_allotted,
+            )
+        else:
+            # No quota header tracking available (might be using Bulk API only or header not present)
+            LOGGER.info(
+                "This job used %d REST API requests (internal count)",
+                internal_count,
+            )
 
     # pylint: disable=anomalous-backslash-in-string,line-too-long
     def check_rest_quota_usage(self, headers):
@@ -369,11 +418,23 @@ class Salesforce:
         if match is None:
             return
 
-        remaining, allotted = map(int, match.groups())
+        used, allotted = map(int, match.groups())
+        
+        # Track maximum quota used to get the most accurate end value
+        # (since header reflects system-wide usage, not just this job)
+        if used > self._max_quota_used_seen:
+            self._max_quota_used_seen = used
+        
+        # Store initial quota on first check (if not already set)
+        if self._initial_quota_used is None:
+            self._initial_quota_used = used
+            self._initial_quota_allotted = allotted
+        
+        # Always update final quota to track the latest value
+        self._final_quota_used = self._max_quota_used_seen
+        self._final_quota_allotted = allotted
 
-        LOGGER.info("Used %s of %s daily REST API quota", remaining, allotted)
-
-        percent_used_from_total = (remaining / allotted) * 100
+        percent_used_from_total = (used / allotted) * 100
         max_requests_for_run = int((self.quota_percent_per_run * allotted) / 100)
 
         if percent_used_from_total > self.quota_percent_total:
@@ -382,7 +443,7 @@ class Salesforce:
                 + "used across all Salesforce Applications. Terminating "
                 + "replication to not continue past configured percentage "
                 + "of {}% total quota."
-            ).format(remaining, allotted, percent_used_from_total, self.quota_percent_total)
+            ).format(used, allotted, percent_used_from_total, self.quota_percent_total)
             raise TapSalesforceQuotaExceededError(total_message)
         elif self.rest_requests_attempted > max_requests_for_run:
             partial_message = (

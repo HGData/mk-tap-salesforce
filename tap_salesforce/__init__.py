@@ -526,11 +526,8 @@ def main_impl():
         )
         sf.login()
 
-        # Log API quota at the start of connection
-        LOGGER.info("=" * 60)
-        LOGGER.info("Starting Salesforce connection - API Quota Status")
-        LOGGER.info("=" * 60)
-        sf.log_api_quota("Initial")
+        # Note: We track quota usage from response headers instead of calling /limits endpoint
+        # to avoid wasting API calls on an endpoint that may require special permissions
 
         if args.discover:
             do_discover(sf, CONFIG.get("streams_to_discover", []))
@@ -540,17 +537,10 @@ def main_impl():
             do_sync(sf, catalog, state)
     finally:
         if sf:
-            # Log API quota at the end of connection
-            LOGGER.info("=" * 60)
-            LOGGER.info("Completing Salesforce connection - API Quota Status")
-            LOGGER.info("=" * 60)
-            sf.log_api_quota("Final")
+            # Log how much quota this specific job consumed
+            # (tracked from response headers, no additional API calls needed)
+            sf.log_job_quota_usage()
 
-            if sf.rest_requests_attempted > 0:
-                LOGGER.info(
-                    "This job used %s REST requests towards the Salesforce quota.",
-                    sf.rest_requests_attempted,
-                )
             if sf.jobs_completed > 0:
                 LOGGER.info(
                     "Replication used %s Bulk API jobs towards the Salesforce quota.",
