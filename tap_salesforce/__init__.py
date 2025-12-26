@@ -482,7 +482,10 @@ async def sync_catalog_entry(sf, catalog_entry, state):
 def do_sync(sf, catalog, state):
     LOGGER.info("Starting sync")
 
-    max_workers = CONFIG.get("max_workers", 8)
+    # Reduce default concurrent workers from 8 to 4 to reduce API pressure
+    # Users can still override this via config if needed
+    max_workers = CONFIG.get("max_workers", 4)
+    LOGGER.info("Using %d concurrent workers for sync", max_workers)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     loop = asyncio.get_event_loop()
     loop.set_default_executor(executor)
@@ -523,6 +526,12 @@ def main_impl():
         )
         sf.login()
 
+        # Log API quota at the start of connection
+        LOGGER.info("=" * 60)
+        LOGGER.info("Starting Salesforce connection - API Quota Status")
+        LOGGER.info("=" * 60)
+        sf.log_api_quota("Initial")
+
         if args.discover:
             do_discover(sf, CONFIG.get("streams_to_discover", []))
         elif args.properties or args.catalog:
@@ -531,13 +540,19 @@ def main_impl():
             do_sync(sf, catalog, state)
     finally:
         if sf:
+            # Log API quota at the end of connection
+            LOGGER.info("=" * 60)
+            LOGGER.info("Completing Salesforce connection - API Quota Status")
+            LOGGER.info("=" * 60)
+            sf.log_api_quota("Final")
+
             if sf.rest_requests_attempted > 0:
-                LOGGER.debug(
+                LOGGER.info(
                     "This job used %s REST requests towards the Salesforce quota.",
                     sf.rest_requests_attempted,
                 )
             if sf.jobs_completed > 0:
-                LOGGER.debug(
+                LOGGER.info(
                     "Replication used %s Bulk API jobs towards the Salesforce quota.",
                     sf.jobs_completed,
                 )

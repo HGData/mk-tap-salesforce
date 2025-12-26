@@ -15,10 +15,13 @@ from tap_salesforce.salesforce.exceptions import (
     TapSalesforceQuotaExceededError,
 )
 
-BATCH_STATUS_POLLING_SLEEP = 20
-PK_CHUNKED_BATCH_STATUS_POLLING_SLEEP = 60
+# Optimized polling intervals to reduce API calls
+BATCH_STATUS_POLLING_SLEEP = 30  # Increased from 20 to reduce polling frequency
+PK_CHUNKED_BATCH_STATUS_POLLING_SLEEP = 90  # Increased from 60 to reduce polling frequency
 ITER_CHUNK_SIZE = 1024
 DEFAULT_CHUNK_SIZE = 50000
+# Cache quota check results for 5 minutes to avoid excessive API calls
+QUOTA_CHECK_CACHE_TTL = 300  # 5 minutes in seconds
 
 LOGGER = singer.get_logger()
 
@@ -47,8 +50,12 @@ class Bulk:
         # Set csv max reading size to the platform's max size available.
         csv.field_size_limit(sys.maxsize)
         self.sf = sf
+        # Cache for quota checks to reduce API calls
+        self._quota_cache = None
+        self._quota_cache_timestamp = None
 
     def query(self, catalog_entry, state):
+        # Only check quota periodically, not before every query
         self.check_bulk_quota_usage()
 
         yield from self._bulk_query(catalog_entry, state)
@@ -57,16 +64,38 @@ class Bulk:
 
     # pylint: disable=line-too-long
     def check_bulk_quota_usage(self):
-        endpoint = "limits"
-        url = self.sf.data_url.format(self.sf.instance_url, endpoint)
+        """Check bulk quota usage with caching to reduce API calls."""
+        current_time = time.time()
+        
+        # Use cached quota data if it's still fresh (within TTL)
+        if (
+            self._quota_cache is not None
+            and self._quota_cache_timestamp is not None
+            and (current_time - self._quota_cache_timestamp) < QUOTA_CHECK_CACHE_TTL
+        ):
+            quota_max = self._quota_cache["quota_max"]
+            quota_remaining = self._quota_cache["quota_remaining"]
+            LOGGER.debug("Using cached quota data (age: %.1fs)", current_time - self._quota_cache_timestamp)
+        else:
+            # Fetch fresh quota data
+            endpoint = "limits"
+            url = self.sf.data_url.format(self.sf.instance_url, endpoint)
 
-        with metrics.http_request_timer(endpoint):
-            resp = self.sf._make_request("GET", url, headers=self.sf.auth.rest_headers).json()
+            with metrics.http_request_timer(endpoint):
+                resp = self.sf._make_request("GET", url, headers=self.sf.auth.rest_headers).json()
 
-        quota_max = resp["DailyBulkApiBatches"]["Max"]
+            quota_max = resp["DailyBulkApiBatches"]["Max"]
+            quota_remaining = resp["DailyBulkApiBatches"]["Remaining"]
+            
+            # Cache the results
+            self._quota_cache = {
+                "quota_max": quota_max,
+                "quota_remaining": quota_remaining,
+            }
+            self._quota_cache_timestamp = current_time
+            LOGGER.debug("Fetched fresh quota data and cached it")
+
         max_requests_for_run = int((self.sf.quota_percent_per_run * quota_max) / 100)
-
-        quota_remaining = resp["DailyBulkApiBatches"]["Remaining"]
         percent_used = (1 - (quota_remaining / quota_max)) * 100
 
         if percent_used > self.sf.quota_percent_total:
@@ -207,6 +236,9 @@ class Bulk:
 
     def _poll_on_pk_chunked_batch_status(self, job_id):
         batches = self._get_batches(job_id)
+        # Use exponential backoff for polling to reduce API calls
+        sleep_time = PK_CHUNKED_BATCH_STATUS_POLLING_SLEEP
+        max_sleep_time = 300  # Cap at 5 minutes
 
         while True:
             queued_batches = [b["id"] for b in batches if b["state"] == "Queued"]
@@ -217,14 +249,21 @@ class Bulk:
                 failed_batches = [b["id"] for b in batches if b["state"] == "Failed"]
                 return {"completed": completed_batches, "failed": failed_batches}
             else:
-                time.sleep(PK_CHUNKED_BATCH_STATUS_POLLING_SLEEP)
+                time.sleep(sleep_time)
+                # Increase sleep time exponentially, but cap it
+                sleep_time = min(sleep_time * 1.2, max_sleep_time)
                 batches = self._get_batches(job_id)
 
     def _poll_on_batch_status(self, job_id, batch_id):
         batch_status = self._get_batch(job_id=job_id, batch_id=batch_id)
+        # Use exponential backoff for polling to reduce API calls
+        sleep_time = BATCH_STATUS_POLLING_SLEEP
+        max_sleep_time = 120  # Cap at 2 minutes
 
         while batch_status["state"] not in ["Completed", "Failed", "Not Processed"]:
-            time.sleep(BATCH_STATUS_POLLING_SLEEP)
+            time.sleep(sleep_time)
+            # Increase sleep time exponentially, but cap it
+            sleep_time = min(sleep_time * 1.2, max_sleep_time)
             batch_status = self._get_batch(job_id=job_id, batch_id=batch_id)
 
         return batch_status

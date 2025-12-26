@@ -10,8 +10,9 @@ This is a forked version of [tap-salesforce (v1.4.24)](https://github.com/singer
 Main differences from the original version:
 
 - Support for `username/password/security_token` authentication
-- Support for concurrent execution (8 threads by default) when accessing different API endpoints to speed up the extraction process
+- Support for concurrent execution (4 threads by default) when accessing different API endpoints to speed up the extraction process
 - Support for much faster discovery
+- **API consumption optimizations**: Reduced API calls through caching, optimized polling, and rate limiting
 
 # Quickstart
 
@@ -71,11 +72,28 @@ The `api_type` is used to switch the behavior of the tap between using Salesforc
 
 The `state_message_threshold` is used to throttle how often STATE messages are generated when the tap is using the "REST" API. This is a balance between not slowing down execution due to too many STATE messages produced and how many records must be fetched again if a tap fails unexpectedly. Defaults to 1000 (generate a STATE message every 1000 records).
 
-The `max_workers` value is used to set the maximum number of threads used in order to concurrently extract data for streams. Defaults to 8 (extract data for 8 streams in paralel).
+The `max_workers` value is used to set the maximum number of threads used in order to concurrently extract data for streams. Defaults to 4 (extract data for 4 streams in parallel) to reduce API consumption. You can increase this if you have higher API limits.
 
 The `streams_to_discover` value may contain a list of Salesforce streams (each ending up in a target table) for which the discovery is handled.
 By default, discovery is handled for all existing streams, which can take several minutes. With just several entities which users typically need it is running few seconds.
 The disadvantage is that you have to keep this list in sync with the `select` section, where you specify all properties(each ending up in a table column).
+
+## API Consumption Optimizations
+
+This tap includes several optimizations to reduce Salesforce API consumption:
+
+- **Caching**: Describe calls and quota checks are cached to avoid redundant API requests
+  - Describe results are cached for 1 hour
+  - Bulk quota checks are cached for 5 minutes
+- **Optimized Polling**: Batch status polling uses exponential backoff with increased initial intervals
+  - Regular batch polling: 30s initial (was 20s)
+  - PK chunked batch polling: 90s initial (was 60s)
+  - Polling intervals increase exponentially up to a maximum
+- **Rate Limiting**: Built-in rate limiting ensures minimum 100ms between requests (max 10 req/sec)
+- **Reduced Concurrency**: Default concurrent workers reduced from 8 to 4 to lower API pressure
+- **Reduced Logging**: Request logging moved to debug level to reduce overhead
+
+These optimizations can significantly reduce API consumption, especially during discovery and when syncing multiple streams.
 
 ## Run Discovery
 

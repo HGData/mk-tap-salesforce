@@ -80,15 +80,29 @@ class Rest:
                 yield record
 
     def _sync_records(self, url, headers, params):
+        page_count = 0
+        total_records = 0
+        
         while True:
             resp = self.sf._make_request("GET", url, headers=headers, params=params)
             resp_json = resp.json()
-
-            yield from resp_json.get("records")
+            
+            # Clear params after first request since subsequent requests use nextRecordsUrl
+            # This prevents unnecessary params from being sent with pagination URLs
+            if page_count == 0:
+                params = None
+            
+            records = resp_json.get("records", [])
+            record_count = len(records)
+            total_records += record_count
+            page_count += 1
+            
+            yield from records
 
             next_records_url = resp_json.get("nextRecordsUrl")
 
             if next_records_url is None:
+                LOGGER.debug("Completed REST API pagination: %d pages, %d total records", page_count, total_records)
                 break
             else:
                 url = f"{self.sf.instance_url}{next_records_url}"

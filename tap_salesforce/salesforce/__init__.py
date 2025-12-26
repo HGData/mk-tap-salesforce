@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from datetime import timedelta
 
 import backoff
@@ -19,6 +20,9 @@ from tap_salesforce.salesforce.exceptions import (
 from tap_salesforce.salesforce.rest import Rest
 
 LOGGER = singer.get_logger()
+
+# Cache describe results for 1 hour to reduce API calls during discovery
+DESCRIBE_CACHE_TTL = 3600  # 1 hour in seconds
 
 BULK_API_TYPE = "BULK"
 BULK2_API_TYPE = "BULK2"
@@ -249,6 +253,12 @@ class Salesforce:
         self.pk_chunking = False
         self.limit_tasks_month = limit_tasks_month
         self.pull_config_objects = pull_config_objects
+        # Cache for describe calls to reduce API consumption
+        self._describe_cache = {}
+        self._describe_cache_timestamps = {}
+        # Rate limiting: track last request time to throttle requests
+        self._last_request_time = 0
+        self._min_request_interval = 0.1  # Minimum 100ms between requests (10 req/sec max)
 
         self.auth = SalesforceAuth.from_credentials(credentials, is_sandbox=self.is_sandbox)
 
@@ -281,6 +291,76 @@ class Salesforce:
         except (json.JSONDecodeError, TypeError, KeyError) as e:
             LOGGER.warning(f"Failed to parse OBJECTS configuration: {e}")
             return []
+
+    def get_api_quota_info(self):
+        """Fetch and return current API quota information from Salesforce."""
+        endpoint = "limits"
+        url = self.data_url.format(self.instance_url, endpoint)
+
+        try:
+            resp = self._make_request("GET", url, headers=self.auth.rest_headers).json()
+
+            quota_info = {}
+
+            # REST API quota
+            if "DailyApiRequests" in resp:
+                rest_used = resp["DailyApiRequests"]["Max"] - resp["DailyApiRequests"]["Remaining"]
+                rest_max = resp["DailyApiRequests"]["Max"]
+                rest_remaining = resp["DailyApiRequests"]["Remaining"]
+                rest_percent = (rest_used / rest_max * 100) if rest_max > 0 else 0
+                quota_info["rest"] = {
+                    "used": rest_used,
+                    "max": rest_max,
+                    "remaining": rest_remaining,
+                    "percent_used": rest_percent,
+                }
+
+            # Bulk API quota
+            if "DailyBulkApiBatches" in resp:
+                bulk_used = resp["DailyBulkApiBatches"]["Max"] - resp["DailyBulkApiBatches"]["Remaining"]
+                bulk_max = resp["DailyBulkApiBatches"]["Max"]
+                bulk_remaining = resp["DailyBulkApiBatches"]["Remaining"]
+                bulk_percent = (bulk_used / bulk_max * 100) if bulk_max > 0 else 0
+                quota_info["bulk"] = {
+                    "used": bulk_used,
+                    "max": bulk_max,
+                    "remaining": bulk_remaining,
+                    "percent_used": bulk_percent,
+                }
+
+            return quota_info
+        except Exception as e:
+            LOGGER.warning("Failed to fetch API quota information: %s", e)
+            return None
+
+    def log_api_quota(self, context="Current"):
+        """Log current API quota status."""
+        quota_info = self.get_api_quota_info()
+
+        if quota_info is None:
+            return
+
+        if "rest" in quota_info:
+            rest = quota_info["rest"]
+            LOGGER.info(
+                "%s REST API Quota: %d/%d used (%.1f%%), %d remaining",
+                context,
+                rest["used"],
+                rest["max"],
+                rest["percent_used"],
+                rest["remaining"],
+            )
+
+        if "bulk" in quota_info:
+            bulk = quota_info["bulk"]
+            LOGGER.info(
+                "%s Bulk API Quota: %d/%d used (%.1f%%), %d remaining",
+                context,
+                bulk["used"],
+                bulk["max"],
+                bulk["percent_used"],
+                bulk["remaining"],
+            )
 
     # pylint: disable=anomalous-backslash-in-string,line-too-long
     def check_rest_quota_usage(self, headers):
@@ -332,14 +412,24 @@ class Salesforce:
         on_backoff=log_backoff_attempt,
     )
     def _make_request(self, http_method, url, headers=None, body=None, stream=False, params=None):
+        # Rate limiting: ensure minimum time between requests
+        current_time = time.time()
+        time_since_last_request = current_time - self._last_request_time
+        if time_since_last_request < self._min_request_interval:
+            sleep_time = self._min_request_interval - time_since_last_request
+            time.sleep(sleep_time)
+
+        # Use debug level for request logging to reduce log verbosity
         if http_method == "GET":
-            LOGGER.info("Making %s request to %s with params: %s", http_method, url, params)
+            LOGGER.debug("Making %s request to %s with params: %s", http_method, url, params)
             resp = self.session.get(url, headers=headers, stream=stream, params=params)
         elif http_method == "POST":
-            LOGGER.info("Making %s request to %s with body %s", http_method, url, body)
+            LOGGER.debug("Making %s request to %s", http_method, url)
             resp = self.session.post(url, headers=headers, data=body)
         else:
             raise TapSalesforceExceptionError("Unsupported HTTP method")
+
+        self._last_request_time = time.time()
 
         raise_for_status(resp)
 
@@ -350,7 +440,22 @@ class Salesforce:
         return resp
 
     def describe(self, sobject=None):
-        """Describes all objects or a specific object"""
+        """Describes all objects or a specific object with caching to reduce API calls"""
+        current_time = time.time()
+        cache_key = str(sobject) if sobject else "all_objects"
+
+        # Check cache first
+        if cache_key in self._describe_cache:
+            cache_age = current_time - self._describe_cache_timestamps.get(cache_key, 0)
+            if cache_age < DESCRIBE_CACHE_TTL:
+                LOGGER.debug("Using cached describe result for %s (age: %.1fs)", cache_key, cache_age)
+                return self._describe_cache[cache_key]
+            else:
+                # Cache expired, remove it
+                LOGGER.debug("Cache expired for %s (age: %.1fs), fetching fresh data", cache_key, cache_age)
+                del self._describe_cache[cache_key]
+                del self._describe_cache_timestamps[cache_key]
+
         headers = self.auth.rest_headers
         instance_url = self.auth.instance_url
         body = None
@@ -385,9 +490,16 @@ class Salesforce:
             resp = self._make_request(method, url, headers=headers, body=body)
 
         if isinstance(sobject, list):
-            return resp.json()["results"]
+            result = resp.json()["results"]
         else:
-            return resp.json()
+            result = resp.json()
+
+        # Cache the result
+        self._describe_cache[cache_key] = result
+        self._describe_cache_timestamps[cache_key] = current_time
+        LOGGER.debug("Cached describe result for %s", cache_key)
+
+        return result
 
     # pylint: disable=no-self-use
     def _get_selected_properties(self, catalog_entry):
