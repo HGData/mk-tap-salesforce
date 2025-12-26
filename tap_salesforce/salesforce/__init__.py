@@ -300,7 +300,7 @@ class Salesforce:
 
     def get_api_quota_info(self):
         """Fetch and return current API quota information from Salesforce.
-        
+
         Note: This endpoint requires special permissions and may return 403 Forbidden.
         If it fails, we fall back to header-based quota tracking.
         """
@@ -325,7 +325,7 @@ class Salesforce:
                     "remaining": rest_remaining,
                     "percent_used": rest_percent,
                 }
-                
+
                 # Capture initial quota if not already set (from limits endpoint)
                 if self._initial_quota_used is None:
                     self._initial_quota_used = rest_used
@@ -350,7 +350,9 @@ class Salesforce:
             # 403 Forbidden is common - user doesn't have permission to access /limits endpoint
             # This is fine, we'll use header-based tracking instead
             if e.response and e.response.status_code == 403:
-                LOGGER.debug("Cannot access /limits endpoint (403 Forbidden) - using header-based quota tracking instead")
+                LOGGER.debug(
+                    "Cannot access /limits endpoint (403 Forbidden) - using header-based quota tracking instead"
+                )
             else:
                 LOGGER.debug("Failed to fetch API quota information from /limits endpoint: %s", e)
             return None
@@ -386,17 +388,17 @@ class Salesforce:
                 bulk["percent_used"],
                 bulk["remaining"],
             )
-    
+
     def log_job_quota_usage(self):
         """Log how much API quota this job consumed from start to end."""
         # Always show internal counter (most accurate for this job)
         internal_count = self.rest_requests_attempted
-        
+
         # Also show quota header tracking if available
         if self._initial_quota_used is not None and self._final_quota_used is not None:
             quota_used_by_job = self._final_quota_used - self._initial_quota_used
             LOGGER.info(
-                "This job used %d REST API requests (internal count: %d, system-wide quota change: %d from %d to %d out of %d total)",
+                "This job used %d REST API requests (internal count: %d, system-wide quota change: %d from %d to %d out of %d total)",  # noqa: E501
                 internal_count,
                 internal_count,
                 quota_used_by_job,
@@ -419,17 +421,17 @@ class Salesforce:
             return
 
         used, allotted = map(int, match.groups())
-        
+
         # Track maximum quota used to get the most accurate end value
         # (since header reflects system-wide usage, not just this job)
         if used > self._max_quota_used_seen:
             self._max_quota_used_seen = used
-        
+
         # Store initial quota on first check (if not already set)
         if self._initial_quota_used is None:
             self._initial_quota_used = used
             self._initial_quota_allotted = allotted
-        
+
         # Always update final quota to track the latest value
         self._final_quota_used = self._max_quota_used_seen
         self._final_quota_allotted = allotted
