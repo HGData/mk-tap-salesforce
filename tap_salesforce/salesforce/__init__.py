@@ -496,8 +496,21 @@ class Salesforce:
 
         raise_for_status(resp)
 
+        # Increment counter for ALL successful API requests
+        # (not just those with Sforce-Limit-Info header, as many Bulk API calls don't include it)
+        self.rest_requests_attempted += 1
+        
+        # Log API call details for debugging (only at debug level to avoid spam)
+        LOGGER.debug(
+            "API call #%d: %s %s (has Sforce-Limit-Info: %s)",
+            self.rest_requests_attempted,
+            http_method,
+            url.split("?")[0] if "?" in url else url,  # Strip query params for readability
+            resp.headers.get("Sforce-Limit-Info") is not None,
+        )
+
+        # Check quota usage if header is present (for quota tracking)
         if resp.headers.get("Sforce-Limit-Info") is not None:
-            self.rest_requests_attempted += 1
             self.check_rest_quota_usage(resp.headers)
 
         return resp
