@@ -22,6 +22,12 @@ from tap_salesforce.salesforce.exceptions import (
     TapSalesforceExceptionError,
     TapSalesforceQuotaExceededError,
 )
+from tap_salesforce.observability import (
+    log_quota_consumed,
+    log_quota_status,
+    log_sync_complete,
+    log_sync_start,
+)
 from tap_salesforce.sync import (
     get_stream_version,
     resume_syncing_bulk_query,
@@ -509,6 +515,7 @@ def main_impl():
 
     credentials = parse_credentials(CONFIG)
     sf = None
+    sync_error = None
     try:
         sf = Salesforce(
             credentials=credentials,
@@ -528,9 +535,37 @@ def main_impl():
         elif args.properties or args.catalog:
             catalog = args.properties or args.catalog.to_dict()
             state = build_state(args.state, catalog)
+            
+            # Log sync start for observability
+            log_sync_start(sf, catalog, CONFIG)
+            
             do_sync(sf, catalog, state)
+    except Exception as e:
+        sync_error = e
+        raise
     finally:
         if sf:
+            # Log sync completion for observability (success or failure)
+            log_sync_complete(
+                sf,
+                CONFIG,
+                success=(sync_error is None),
+                error=sync_error,
+            )
+
+            # Log post-extraction quota status and delta
+            if sf._latest_quota_used is not None:
+                log_quota_status(
+                    sf, sf._latest_quota_used, sf._latest_quota_allotted, phase="post_extract"
+                )
+                if sf._initial_quota_used is not None:
+                    log_quota_consumed(
+                        sf,
+                        sf._initial_quota_used,
+                        sf._latest_quota_used,
+                        sf._latest_quota_allotted,
+                    )
+
             if sf.rest_requests_attempted > 0:
                 LOGGER.debug(
                     "This job used %s REST requests towards the Salesforce quota.",
