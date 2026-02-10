@@ -69,6 +69,7 @@ def log_sync_start(
         "max_workers": config.get("max_workers", 8),
         "is_sandbox": sf.is_sandbox,
         "instance_url": sf.instance_url if hasattr(sf, "instance_url") else None,
+        "level": "WARNING",
     }
 
     # Log as JSON for Datadog parsing
@@ -102,6 +103,7 @@ def log_sync_complete(
         "quota_percent_total_limit": sf.quota_percent_total,
         "quota_percent_per_run_limit": sf.quota_percent_per_run,
         **_dd_metric("mdi.salesforce.api.requests_by_job", sf.rest_requests_attempted, "count"),
+        "level": "WARNING"
     }
 
     if error:
@@ -144,6 +146,7 @@ def log_quota_status(
         "quota_percent_total_limit": sf.quota_percent_total,
         "is_near_limit": percent_used >= sf.quota_percent_total,
         **_dd_metric(f"mdi.salesforce.api.{phase}", round(percent_used, 2)),
+        "level": "WARNING"
     }
 
     LOGGER.warning(json.dumps(log_data))
@@ -177,6 +180,7 @@ def log_quota_consumed(
         "post_used": post_used,
         "allotted": allotted,
         **_dd_metric("mdi.salesforce.api.calls_consumed", calls_consumed),
+        "level": "WARNING"
     }
 
     LOGGER.warning(json.dumps(log_data))
@@ -198,6 +202,7 @@ def log_stream_sync_start(
         "tenant_id": get_tenant_id(),
         "stream_name": stream_name,
         "replication_method": replication_method,
+        "level": "WARNING"
     }
 
     LOGGER.warning(json.dumps(log_data))
@@ -223,6 +228,7 @@ def log_stream_sync_complete(
         "records_count": records_count,
         "success": success,
         **_dd_metric("mdi.salesforce.stream.records", records_count or 0, "count"),
+        "level": "WARNING"
     }
 
     LOGGER.warning(json.dumps(log_data))

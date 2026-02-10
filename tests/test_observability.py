@@ -89,11 +89,12 @@ class TestLogSyncStart:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_sync_start(mock_sf, catalog, config)
 
-        mock_logger.info.assert_called_once()
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        mock_logger.warning.assert_called_once()
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["event_type"] == "salesforce_sync_start"
+        assert log_json["level"] == "WARNING"
         assert log_json["tenant_id"] == "3303"
         assert log_json["api_type"] == "REST"
         assert log_json["streams_count"] == 2
@@ -121,10 +122,11 @@ class TestLogSyncComplete:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_sync_complete(mock_sf, {})
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["event_type"] == "salesforce_sync_complete"
+        assert log_json["level"] == "WARNING"
         assert log_json["dd"]["metric_name"] == "mdi.salesforce.api.requests_by_job"
         assert log_json["dd"]["metric_value"] == 500
         assert log_json["dd"]["metric_type"] == "count"
@@ -137,8 +139,8 @@ class TestLogSyncComplete:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_sync_complete(mock_sf, {}, success=False, error=error)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["success"] is False
         assert log_json["error_type"] == "RuntimeError"
@@ -150,8 +152,8 @@ class TestLogSyncComplete:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_sync_complete(mock_sf, {}, records_synced=10000)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["records_synced"] == 10000
 
@@ -173,10 +175,11 @@ class TestLogQuotaStatus:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_status(mock_sf, used=5000, allotted=100000, phase="pre_extract")
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["event_type"] == "salesforce_quota_status"
+        assert log_json["level"] == "WARNING"
         assert log_json["phase"] == "pre_extract"
         assert log_json["quota_used"] == 5000
         assert log_json["quota_allotted"] == 100000
@@ -191,8 +194,8 @@ class TestLogQuotaStatus:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_status(mock_sf, used=7500, allotted=100000, phase="post_extract")
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["phase"] == "post_extract"
         assert log_json["dd"]["metric_name"] == "mdi.salesforce.api.post_extract"
@@ -204,8 +207,8 @@ class TestLogQuotaStatus:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_status(mock_sf, used=5000, allotted=100000)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["phase"] == "current"
         assert log_json["dd"]["metric_name"] == "mdi.salesforce.api.current"
@@ -216,8 +219,8 @@ class TestLogQuotaStatus:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_status(mock_sf, used=85000, allotted=100000, phase="post_extract")
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["is_near_limit"] is True
         assert log_json["quota_percent_used"] == 85.0
@@ -228,8 +231,8 @@ class TestLogQuotaStatus:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_status(mock_sf, used=0, allotted=0, phase="pre_extract")
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["quota_percent_used"] == 0
         assert log_json["dd"]["metric_value"] == 0
@@ -251,10 +254,11 @@ class TestLogQuotaConsumed:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_consumed(mock_sf, pre_used=5000, post_used=7500, allotted=100000)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["event_type"] == "salesforce_quota_consumed"
+        assert log_json["level"] == "WARNING"
         assert log_json["tenant_id"] == "3303"
         assert log_json["calls_consumed"] == 2500
         assert log_json["percent_consumed"] == 2.5
@@ -270,8 +274,8 @@ class TestLogQuotaConsumed:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_consumed(mock_sf, pre_used=5000, post_used=5000, allotted=100000)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["calls_consumed"] == 0
         assert log_json["dd"]["metric_value"] == 0
@@ -282,8 +286,8 @@ class TestLogQuotaConsumed:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_quota_consumed(mock_sf, pre_used=0, post_used=0, allotted=0)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["percent_consumed"] == 0
 
@@ -297,10 +301,11 @@ class TestLogStreamSyncComplete:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_stream_sync_complete("Lead", records_count=5000)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["event_type"] == "salesforce_stream_complete"
+        assert log_json["level"] == "WARNING"
         assert log_json["stream_name"] == "Lead"
         assert log_json["records_count"] == 5000
         assert log_json["dd"]["metric_name"] == "mdi.salesforce.stream.records"
@@ -313,8 +318,8 @@ class TestLogStreamSyncComplete:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_stream_sync_complete("Contact", records_count=None)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["dd"]["metric_value"] == 0
 
@@ -324,7 +329,7 @@ class TestLogStreamSyncComplete:
         with patch.dict(os.environ, {"TENANT": "3303"}):
             log_stream_sync_complete("Lead", records_count=0, success=False)
 
-        call_args = mock_logger.info.call_args
-        log_json = json.loads(call_args[0][1])
+        call_args = mock_logger.warning.call_args
+        log_json = json.loads(call_args[0][0])
 
         assert log_json["success"] is False
