@@ -72,7 +72,7 @@ def log_sync_start(
     }
 
     # Log as JSON for Datadog parsing
-    LOGGER.info("salesforce_sync_start: %s", json.dumps(log_data))
+    LOGGER.warning(json.dumps(log_data))
 
 
 def log_sync_complete(
@@ -112,7 +112,7 @@ def log_sync_complete(
         log_data["records_synced"] = records_synced
 
     # Log as JSON for Datadog parsing
-    LOGGER.info("salesforce_sync_complete: %s", json.dumps(log_data))
+    LOGGER.warning(json.dumps(log_data))
 
 
 def log_quota_status(
@@ -146,7 +146,7 @@ def log_quota_status(
         **_dd_metric(f"mdi.salesforce.api.{phase}", round(percent_used, 2)),
     }
 
-    LOGGER.info("salesforce_quota_status: %s", json.dumps(log_data))
+    LOGGER.warning(json.dumps(log_data))
 
 
 def log_quota_consumed(
@@ -179,7 +179,7 @@ def log_quota_consumed(
         **_dd_metric("mdi.salesforce.api.calls_consumed", calls_consumed),
     }
 
-    LOGGER.info("salesforce_quota_consumed: %s", json.dumps(log_data))
+    LOGGER.warning(json.dumps(log_data))
 
 
 def log_stream_sync_start(
@@ -200,7 +200,7 @@ def log_stream_sync_start(
         "replication_method": replication_method,
     }
 
-    LOGGER.info("salesforce_stream_start: %s", json.dumps(log_data))
+    LOGGER.warning(json.dumps(log_data))
 
 
 def log_stream_sync_complete(
@@ -225,4 +225,4 @@ def log_stream_sync_complete(
         **_dd_metric("mdi.salesforce.stream.records", records_count or 0, "count"),
     }
 
-    LOGGER.info("salesforce_stream_complete: %s", json.dumps(log_data))
+    LOGGER.warning(json.dumps(log_data))
