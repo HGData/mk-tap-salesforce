@@ -8,6 +8,7 @@ import singer
 import singer.utils as singer_utils
 from singer import metadata, metrics
 
+from tap_salesforce.observability import log_quota_status
 from tap_salesforce.salesforce.bulk import Bulk
 from tap_salesforce.salesforce.bulk2 import Bulk2
 from tap_salesforce.salesforce.credentials import SalesforceAuth
@@ -247,6 +248,12 @@ class Salesforce:
         self.jobs_completed = 0
         self.data_url = "{}/services/data/v60.0/{}"
         self.pk_chunking = False
+
+        # Quota tracking for before/after extraction monitoring
+        self._initial_quota_used = None
+        self._initial_quota_allotted = None
+        self._latest_quota_used = None
+        self._latest_quota_allotted = None
         self.limit_tasks_month = limit_tasks_month
         self.pull_config_objects = pull_config_objects
 
@@ -289,11 +296,25 @@ class Salesforce:
         if match is None:
             return
 
-        remaining, allotted = map(int, match.groups())
+        used, allotted = map(int, match.groups())
 
-        LOGGER.info("Used %s of %s daily REST API quota", remaining, allotted)
+        LOGGER.warning("Used %s of %s daily REST API quota", used, allotted)
 
-        percent_used_from_total = (remaining / allotted) * 100
+        # Track initial quota snapshot (first API response)
+        if self._initial_quota_used is None:
+            self._initial_quota_used = used
+            self._initial_quota_allotted = allotted
+            log_quota_status(self, used, allotted, phase="pre_extract")
+
+        # Always track the latest values
+        self._latest_quota_used = used
+        self._latest_quota_allotted = allotted
+
+        # Log quota status periodically for monitoring
+        if self.rest_requests_attempted > 0 and self.rest_requests_attempted % 1000 == 0:
+            log_quota_status(self, used, allotted, phase="current")
+
+        percent_used_from_total = (used / allotted) * 100
         max_requests_for_run = int((self.quota_percent_per_run * allotted) / 100)
 
         if percent_used_from_total > self.quota_percent_total:
@@ -302,7 +323,7 @@ class Salesforce:
                 + "used across all Salesforce Applications. Terminating "
                 + "replication to not continue past configured percentage "
                 + "of {}% total quota."
-            ).format(remaining, allotted, percent_used_from_total, self.quota_percent_total)
+            ).format(used, allotted, percent_used_from_total, self.quota_percent_total)
             raise TapSalesforceQuotaExceededError(total_message)
         elif self.rest_requests_attempted > max_requests_for_run:
             partial_message = (
