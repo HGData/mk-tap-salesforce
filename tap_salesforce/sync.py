@@ -117,6 +117,8 @@ def sync_stream(sf, catalog_entry, state, state_msg_threshold):
 
 
 def sync_records(sf, catalog_entry, state, counter, state_msg_threshold):
+    from tap_salesforce import CONFIG
+
     chunked_bookmark = singer_utils.strptime_with_tz(sf.get_start_date(state, catalog_entry))
     stream = catalog_entry["stream"]
     schema = catalog_entry["schema"]
@@ -156,7 +158,10 @@ def sync_records(sf, catalog_entry, state, counter, state_msg_threshold):
                     state,
                     catalog_entry["tap_stream_id"],
                     "JobHighestBookmarkSeen",
-                    tap_output.safe_bookmark_value(stream, "JobHighestBookmarkSeen", singer_utils.strftime(chunked_bookmark)),
+                    tap_output.safe_bookmark_value(
+                        stream, "JobHighestBookmarkSeen", singer_utils.strftime(chunked_bookmark),
+                        max_future_seconds=CONFIG.get("max_future_bookmark_seconds", 3600)
+                    ),
                 )
 
                 if counter.value % state_msg_threshold == 0:
@@ -168,7 +173,11 @@ def sync_records(sf, catalog_entry, state, counter, state_msg_threshold):
                 state,
                 catalog_entry["tap_stream_id"],
                 replication_key,
-                tap_output.safe_bookmark_value(stream, replication_key, rec[replication_key]),
+                #tap_output.safe_bookmark_value(stream, replication_key, rec[replication_key]),
+                tap_output.safe_bookmark_value(
+                    stream, replication_key, rec[replication_key],
+                    max_future_seconds=CONFIG.get("max_future_bookmark_seconds", 3600)
+                ),
             )
 
             if counter.value % state_msg_threshold == 0:
@@ -187,7 +196,11 @@ def sync_records(sf, catalog_entry, state, counter, state_msg_threshold):
             state,
             catalog_entry["tap_stream_id"],
             replication_key,
-            tap_output.safe_bookmark_value(stream, replication_key, singer_utils.strftime(chunked_bookmark)),
+            #tap_output.safe_bookmark_value(stream, replication_key, singer_utils.strftime(chunked_bookmark)),
+            tap_output.safe_bookmark_value(
+                stream, replication_key, singer_utils.strftime(chunked_bookmark),
+                max_future_seconds=CONFIG.get("max_future_bookmark_seconds", 3600)
+            ),
         )
 
 

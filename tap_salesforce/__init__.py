@@ -470,7 +470,10 @@ async def sync_catalog_entry(sf, catalog_entry, state):
             bookmark = (
                 state.get("bookmarks", {}).get(catalog_entry["tap_stream_id"], {}).pop("JobHighestBookmarkSeen", None)
             )
-            bookmark = tap_output.safe_bookmark_value(stream_name, replication_key, bookmark)
+            bookmark = tap_output.safe_bookmark_value(
+                stream_name, replication_key, bookmark,
+                max_future_seconds=CONFIG.get("max_future_bookmark_seconds", 3600)
+            )
             state = singer.write_bookmark(state, catalog_entry["tap_stream_id"], replication_key, bookmark)
             tap_output.write_state(state)
     else:
