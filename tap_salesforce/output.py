@@ -21,7 +21,7 @@ def write_schema(stream_name, schema, key_properties,
                  replication_key=None, stream_alias=None):
     with _stdout_lock:
         singer.write_schema(stream_name, schema, key_properties,
-                            replication_key=replication_key,
+                            bookmark_properties=replication_key,
                             stream_alias=stream_alias)
 
 def write_state(state):
