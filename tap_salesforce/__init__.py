@@ -22,6 +22,7 @@ from tap_salesforce.salesforce.exceptions import (
     TapSalesforceExceptionError,
     TapSalesforceQuotaExceededError,
 )
+from tap_salesforce import output as tap_output
 from tap_salesforce.observability import (
     log_quota_consumed,
     log_quota_status,
@@ -436,14 +437,14 @@ async def sync_catalog_entry(sf, catalog_entry, state):
 
     LOGGER.info("%s: Starting", stream_name)
 
-    singer.write_state(state)
+    tap_output.write_state(state)
     key_properties = metadata.to_map(catalog_entry["metadata"]).get((), {}).get("table-key-properties")
 
     # Filter the schema for selected fields
     schema = deepcopy(catalog_entry["schema"])
     pop_deselected_schema(schema, stream_name, (), mdata)
 
-    singer.write_schema(stream, schema, key_properties, replication_key, stream_alias)
+    tap_output.write_schema(stream, schema, key_properties, replication_key=replication_key, stream_alias=stream_alias)
     loop = asyncio.get_event_loop()
 
     job_id = singer.get_bookmark(state, catalog_entry["tap_stream_id"], "JobID")
@@ -469,8 +470,12 @@ async def sync_catalog_entry(sf, catalog_entry, state):
             bookmark = (
                 state.get("bookmarks", {}).get(catalog_entry["tap_stream_id"], {}).pop("JobHighestBookmarkSeen", None)
             )
+            bookmark = tap_output.safe_bookmark_value(
+                stream_name, replication_key, bookmark,
+                max_future_seconds=CONFIG.get("max_future_bookmark_seconds", 3600)
+            )
             state = singer.write_bookmark(state, catalog_entry["tap_stream_id"], replication_key, bookmark)
-            singer.write_state(state)
+            tap_output.write_state(state)
     else:
         state_msg_threshold = CONFIG.get("state_message_threshold", 1000)
 
@@ -479,7 +484,7 @@ async def sync_catalog_entry(sf, catalog_entry, state):
         bookmark_is_empty = state.get("bookmarks", {}).get(catalog_entry["tap_stream_id"]) is None
 
         if replication_key or bookmark_is_empty:
-            singer.write_message(activate_version_message)
+            tap_output.write_message(activate_version_message)
             state = singer.write_bookmark(state, catalog_entry["tap_stream_id"], "version", stream_version)
         await loop.run_in_executor(None, sync_stream, sf, catalog_entry, state, state_msg_threshold)
         LOGGER.info("Completed sync for %s", stream_name)
@@ -505,7 +510,7 @@ def do_sync(sf, catalog, state):
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
 
-    singer.write_state(state)
+    tap_output.write_state(state)
     LOGGER.info("Finished sync")
 
 
