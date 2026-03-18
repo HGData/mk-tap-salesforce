@@ -273,6 +273,57 @@ class Salesforce:
                 default_start_date,
             )
 
+    # Polymorphic dot-notation fields that must be sanitized. Who/What are
+    # polymorphic relationship fields on Task/Event that cause SOQL queryAll
+    # to fail with 400 Bad Request (OPERATION_TOO_LARGE).
+    _POLYMORPHIC_CONVERT = frozenset({"Who.Id", "What.Id"})   # -> WhoId, WhatId
+    _POLYMORPHIC_DROP = frozenset({"Who.Type", "What.Type"})   # not valid scalar SOQL fields
+
+    @staticmethod
+    def _sanitize_polymorphic_columns(columns: list[str], stream: str) -> list[str]:
+        """Sanitize known polymorphic dot-notation fields on Salesforce objects.
+
+        Only handles the four known problematic fields (Who.Id, Who.Type,
+        What.Id, What.Type). Other dot-notation fields are left untouched
+        with a warning, since they may be legitimate relationship traversals.
+        """
+        sanitized = []
+        for col in columns:
+            if col in Salesforce._POLYMORPHIC_DROP:
+                LOGGER.warning(
+                    "Dropping polymorphic field '%s' from %s "
+                    "(not a valid scalar SOQL field)",
+                    col, stream,
+                )
+                continue
+
+            if col in Salesforce._POLYMORPHIC_CONVERT:
+                scalar_name = col.replace(".", "")  # Who.Id -> WhoId
+                LOGGER.warning(
+                    "Converting polymorphic field '%s' to '%s' for %s",
+                    col, scalar_name, stream,
+                )
+                sanitized.append(scalar_name)
+                continue
+
+            if "." in col:
+                LOGGER.warning(
+                    "Unrecognized dot-notation field '%s' in %s — leaving as-is",
+                    col, stream,
+                )
+
+            sanitized.append(col)
+
+        # Deduplicate (e.g. if config had both WhoId and Who.Id)
+        seen = set()
+        deduplicated = []
+        for col in sanitized:
+            if col not in seen:
+                seen.add(col)
+                deduplicated.append(col)
+
+        return deduplicated
+
     def _parse_objects_config(self, objects_config: str | list[dict], stream: str) -> list[str]:
         """Parse the OBJECTS configuration string into a list of fields for the given stream."""
         if not objects_config or not stream:
@@ -283,7 +334,8 @@ class Salesforce:
 
             for obj in objects_list:
                 if isinstance(obj, dict) and obj.get('name', '').lower() == stream.lower():
-                    return obj.get('columns', [])
+                    columns = obj.get('columns', [])
+                    return self._sanitize_polymorphic_columns(columns, stream)
             return []
         except (json.JSONDecodeError, TypeError, KeyError) as e:
             LOGGER.warning(f"Failed to parse OBJECTS configuration: {e}")
