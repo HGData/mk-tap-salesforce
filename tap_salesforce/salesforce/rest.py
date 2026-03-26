@@ -23,7 +23,12 @@ class Rest:
     # pylint: disable=too-many-arguments
     def _query_recur(self, query, catalog_entry, start_date_str, end_date=None, retries=MAX_RETRIES):
         params = {"q": query}
-        url = f"{self.sf.instance_url}/services/data/v60.0/query"
+        # Use query endpoint for Task to exclude soft-deleted records (prevents OPERATION_TOO_LARGE)
+        # Use queryAll for other objects to preserve soft-deleted records
+        stream_name = catalog_entry["stream"]
+        is_task = stream_name.lower() == "task"
+        endpoint = "query" if is_task else "queryAll"
+        url = f"{self.sf.instance_url}/services/data/v60.0/{endpoint}"
         headers = self.sf.auth.rest_headers
 
         sync_start = singer_utils.now()
