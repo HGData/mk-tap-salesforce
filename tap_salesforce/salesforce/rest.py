@@ -7,7 +7,7 @@ from tap_salesforce.salesforce.exceptions import TapSalesforceExceptionError
 
 LOGGER = singer.get_logger()
 
-MAX_RETRIES = 4
+MAX_RETRIES = 8
 
 
 class Rest:
@@ -49,11 +49,12 @@ class Rest:
 
         except HTTPError as ex:
             response = ex.response.json()
-            if isinstance(response, list) and response[0].get("errorCode") == "QUERY_TIMEOUT":
+            if isinstance(response, list) and response[0].get("errorCode") in ("QUERY_TIMEOUT", "OPERATION_TOO_LARGE"):
                 start_date = singer_utils.strptime_with_tz(start_date_str)
                 day_range = (end_date - start_date).days
                 LOGGER.info(
-                    "Salesforce returned QUERY_TIMEOUT querying %d days of %s",
+                    "Salesforce returned %s querying %d days of %s — bisecting date range",
+                    response[0].get("errorCode"),
                     day_range,
                     catalog_entry["stream"],
                 )
