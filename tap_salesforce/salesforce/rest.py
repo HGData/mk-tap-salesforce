@@ -23,7 +23,12 @@ class Rest:
     # pylint: disable=too-many-arguments
     def _query_recur(self, query, catalog_entry, start_date_str, end_date=None, retries=MAX_RETRIES):
         params = {"q": query}
-        url = f"{self.sf.instance_url}/services/data/v60.0/queryAll"
+        # Use query endpoint for Task to exclude soft-deleted records (prevents OPERATION_TOO_LARGE)
+        # Use queryAll for other objects to preserve soft-deleted records
+        stream_name = catalog_entry["stream"]
+        is_task = stream_name.lower() == "task"
+        endpoint = "query" if is_task else "queryAll"
+        url = f"{self.sf.instance_url}/services/data/v60.0/{endpoint}"
         headers = self.sf.auth.rest_headers
 
         sync_start = singer_utils.now()
@@ -51,12 +56,19 @@ class Rest:
             response = ex.response.json()
             if isinstance(response, list) and response[0].get("errorCode") in ("QUERY_TIMEOUT", "OPERATION_TOO_LARGE"):
                 start_date = singer_utils.strptime_with_tz(start_date_str)
-                day_range = (end_date - start_date).days
+                total_seconds = (end_date - start_date).total_seconds()
+                end_date_str = singer_utils.strftime(end_date)
+                if total_seconds >= 86400:
+                    range_label = f"{int(total_seconds // 86400)} days"
+                else:
+                    range_label = f"{total_seconds / 3600:.1f} hours"
                 LOGGER.info(
-                    "Salesforce returned %s querying %d days of %s — bisecting date range",
+                    "Salesforce returned %s querying %s of %s (range: %s to %s) — bisecting date range",
                     response[0].get("errorCode"),
-                    day_range,
+                    range_label,
                     catalog_entry["stream"],
+                    start_date_str,
+                    end_date_str,
                 )
                 retryable = True
             else:
@@ -64,12 +76,12 @@ class Rest:
 
         if retryable:
             start_date = singer_utils.strptime_with_tz(start_date_str)
-            half_day_range = (end_date - start_date) // 2
-            end_date = end_date - half_day_range
+            half_range = (end_date - start_date) // 2
+            end_date = end_date - half_range
 
-            if half_day_range.days == 0:
+            if half_range.total_seconds() < 3600:
                 raise TapSalesforceExceptionError(
-                    "Attempting to query by 0 day range, this would cause infinite looping."
+                    "Attempting to query by less than 1 hour range, this would cause infinite looping."
                 )
 
             query = self.sf._build_query_string(
