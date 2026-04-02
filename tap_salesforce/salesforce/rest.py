@@ -1,6 +1,7 @@
 # pylint: disable=protected-access
 import singer
 import singer.utils as singer_utils
+from singer import metadata as singer_metadata
 from requests.exceptions import HTTPError
 
 from tap_salesforce.salesforce.exceptions import TapSalesforceExceptionError
@@ -31,6 +32,10 @@ class Rest:
         url = f"{self.sf.instance_url}/services/data/v60.0/{endpoint}"
         headers = self.sf.auth.rest_headers
 
+        # Resolve the replication key so we can track progress during pagination
+        catalog_meta = singer_metadata.to_map(catalog_entry.get("metadata", []))
+        replication_key = catalog_meta.get((), {}).get("replication-key")
+
         sync_start = singer_utils.now()
         if end_date is None:
             end_date = sync_start
@@ -41,8 +46,15 @@ class Rest:
             )
 
         retryable = False
+        # Track the last replication-key value yielded so that if pagination fails
+        # mid-stream we can resume from that point instead of re-querying from the
+        # original start date (which would re-yield already-streamed records).
+        last_seen_replication_value = None
         try:
-            yield from self._sync_records(url, headers, params)
+            for record in self._sync_records(url, headers, params):
+                if replication_key and record.get(replication_key):
+                    last_seen_replication_value = record[replication_key]
+                yield record
 
             # If the date range was chunked (an end_date was passed), sync
             # from the end_date -> now
@@ -75,22 +87,44 @@ class Rest:
                 raise ex
 
         if retryable:
-            start_date = singer_utils.strptime_with_tz(start_date_str)
-            half_range = (end_date - start_date) // 2
-            end_date = end_date - half_range
-
-            if half_range.total_seconds() < 3600:
-                raise TapSalesforceExceptionError(
-                    "Attempting to query by less than 1 hour range, this would cause infinite looping."
+            if last_seen_replication_value is not None:
+                # Partial pagination: some records were already streamed to the target
+                # before the error. Re-querying from start_date_str would duplicate them.
+                # Resume from the last seen replication-key value instead.
+                LOGGER.info(
+                    "Partial pagination detected for %s — %s records already streamed up to %s. "
+                    "Resuming from that value to avoid duplicates.",
+                    catalog_entry["stream"],
+                    replication_key,
+                    last_seen_replication_value,
                 )
+                resume_query = self.sf._build_query_string(
+                    catalog_entry,
+                    last_seen_replication_value,
+                    singer_utils.strftime(end_date) if end_date < sync_start else None,
+                )
+                for record in self._query_recur(
+                    resume_query, catalog_entry, last_seen_replication_value, end_date, retries - 1
+                ):
+                    yield record
+            else:
+                # No records were yielded yet — safe to bisect the full range.
+                start_date = singer_utils.strptime_with_tz(start_date_str)
+                half_range = (end_date - start_date) // 2
+                end_date = end_date - half_range
 
-            query = self.sf._build_query_string(
-                catalog_entry,
-                singer_utils.strftime(start_date),
-                singer_utils.strftime(end_date),
-            )
-            for record in self._query_recur(query, catalog_entry, start_date_str, end_date, retries - 1):
-                yield record
+                if half_range.total_seconds() < 3600:
+                    raise TapSalesforceExceptionError(
+                        "Attempting to query by less than 1 hour range, this would cause infinite looping."
+                    )
+
+                query = self.sf._build_query_string(
+                    catalog_entry,
+                    singer_utils.strftime(start_date),
+                    singer_utils.strftime(end_date),
+                )
+                for record in self._query_recur(query, catalog_entry, start_date_str, end_date, retries - 1):
+                    yield record
 
     def _sync_records(self, url, headers, params):
         while True:
