@@ -259,11 +259,11 @@ class Salesforce:
 
         self.auth = SalesforceAuth.from_credentials(credentials, is_sandbox=self.is_sandbox)
 
-        # validate start_date
+        # validate start_date; fall back to 2000-01-01 so Group 1 objects pull full history
         self.default_start_date = (
             singer_utils.strptime_to_utc(default_start_date)
             if default_start_date
-            else (singer_utils.now() - timedelta(weeks=4))
+            else singer_utils.strptime_to_utc("2000-01-01T00:00:00Z")
         ).isoformat()
 
         if default_start_date:
@@ -288,6 +288,23 @@ class Salesforce:
         except (json.JSONDecodeError, TypeError, KeyError) as e:
             LOGGER.warning(f"Failed to parse OBJECTS configuration: {e}")
             return []
+
+    def _get_per_stream_start_date(self, stream: str) -> str | None:
+        """Return the start_date configured for a specific stream in the OBJECTS payload, or None."""
+        if not self.pull_config_objects:
+            return None
+        try:
+            objects_list = (
+                json.loads(self.pull_config_objects)
+                if isinstance(self.pull_config_objects, str)
+                else self.pull_config_objects
+            )
+            for obj in objects_list:
+                if isinstance(obj, dict) and obj.get("name", "").lower() == stream.lower():
+                    return obj.get("start_date")
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            LOGGER.warning("Failed to read per-stream start_date from OBJECTS config: %s", e)
+        return None
 
     # pylint: disable=anomalous-backslash-in-string,line-too-long
     def check_rest_quota_usage(self, headers):
@@ -415,6 +432,7 @@ class Salesforce:
         mdata = metadata.to_map(catalog_entry["metadata"])
         properties = catalog_entry["schema"].get("properties", {})
         stream = catalog_entry["stream"]
+
         meltano_selected_fields = [
             k
             for k in properties
@@ -459,19 +477,27 @@ class Salesforce:
             return ingested_fields
         return meltano_selected_fields
 
+    # Streams subject to the limit_tasks_month rolling-window cap
+    WINDOWED_STREAMS = {"Task", "Campaign", "CampaignMember"}
+
     def get_start_date(self, state, catalog_entry):
-        """Get the start date for a stream, applying task month limit if configured."""
+        """Get the start date for a stream, applying month limit for windowed streams if configured."""
         catalog_metadata = metadata.to_map(catalog_entry["metadata"])
         replication_key = catalog_metadata.get((), {}).get("replication-key")
 
-        # Get the bookmark date or default start date
+        # Resolution order: Singer bookmark > per-stream start_date from OBJECTS > tap default
+        per_stream_start = self._get_per_stream_start_date(catalog_entry["tap_stream_id"])
         start_date = (
-            singer.get_bookmark(state, catalog_entry["tap_stream_id"], replication_key) or self.default_start_date
+            singer.get_bookmark(state, catalog_entry["tap_stream_id"], replication_key)
+            or per_stream_start
+            or self.default_start_date
         )
 
-        # Apply task month limit if this is a Task stream and limit is configured
+        # Apply month limit to windowed streams (Task, Campaign, CampaignMember).
+        # Exception: if the user explicitly configured a per-stream start_date that already
+        # falls within the window, honour it rather than overriding with the cap.
         if (
-            catalog_entry["tap_stream_id"] == "Task"
+            catalog_entry["tap_stream_id"] in self.WINDOWED_STREAMS
             and self.limit_tasks_month is not None
             and self.limit_tasks_month > 0
         ):
@@ -480,10 +506,22 @@ class Salesforce:
             month_limit_date = now - timedelta(days=31 * self.limit_tasks_month)
             month_limit_date_str = month_limit_date.isoformat()
 
-            # Use the later of the two dates (bookmark/default vs month limit)
+            # If the user provided a per-stream start_date that is within the window,
+            # use it directly — the explicit config takes priority over the cap.
+            if per_stream_start and per_stream_start >= month_limit_date_str:
+                LOGGER.info(
+                    "%s stream: using user-provided start_date %s (within %d-month window)",
+                    catalog_entry["tap_stream_id"],
+                    per_stream_start,
+                    self.limit_tasks_month,
+                )
+                return per_stream_start
+
+            # Otherwise apply the cap: use the later of the resolved date vs month limit.
             if start_date < month_limit_date_str:
                 LOGGER.info(
-                    "Task stream limited to %d months. Using start date %s instead of %s",
+                    "%s stream limited to %d months. Using start date %s instead of %s",
+                    catalog_entry["tap_stream_id"],
                     self.limit_tasks_month,
                     month_limit_date_str,
                     start_date,

@@ -420,10 +420,11 @@ def pop_deselected_schema(schema, stream_name, breadcrumb, metadata_map):
 
 
 async def sync_catalog_entry(sf, catalog_entry, state):
+    stream_name = catalog_entry["tap_stream_id"]
+
     stream_version = get_stream_version(catalog_entry, state)
     stream = catalog_entry["stream"]
     stream_alias = catalog_entry.get("stream_alias")
-    stream_name = catalog_entry["tap_stream_id"]
     activate_version_message = singer.ActivateVersionMessage(stream=(stream_alias or stream), version=stream_version)
 
     catalog_metadata = metadata.to_map(catalog_entry["metadata"])
