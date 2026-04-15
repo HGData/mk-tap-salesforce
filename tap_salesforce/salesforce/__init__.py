@@ -217,6 +217,8 @@ def field_to_property_schema(field, mdata):  # noqa: C901
 
 
 class Salesforce:
+    WINDOWED_OBJECTS = {"Task", "Campaign", "CampaignMember"}
+
     # pylint: disable=too-many-instance-attributes,too-many-arguments
     def __init__(
         self,
@@ -228,7 +230,8 @@ class Salesforce:
         select_fields_by_default=None,
         default_start_date=None,
         api_type=None,
-        limit_tasks_month=None,
+        windowed_objects=None,
+        limit_windowed_objects_month=None,
         pull_config_objects=None,
     ):
         self.api_type = api_type.upper() if api_type else None
@@ -254,7 +257,8 @@ class Salesforce:
         self._initial_quota_allotted = None
         self._latest_quota_used = None
         self._latest_quota_allotted = None
-        self.limit_tasks_month = limit_tasks_month
+        self.windowed_objects = set(windowed_objects) if windowed_objects else self.WINDOWED_OBJECTS
+        self.limit_windowed_objects_month = limit_windowed_objects_month
         self.pull_config_objects = pull_config_objects
 
         self.auth = SalesforceAuth.from_credentials(credentials, is_sandbox=self.is_sandbox)
@@ -469,22 +473,21 @@ class Salesforce:
             singer.get_bookmark(state, catalog_entry["tap_stream_id"], replication_key) or self.default_start_date
         )
 
-        # Apply task month limit if this is a Task stream and limit is configured
+        # Apply windowed objects month limit if this stream is in windowed_objects and limit is configured
         if (
-            catalog_entry["tap_stream_id"] == "Task"
-            and self.limit_tasks_month is not None
-            and self.limit_tasks_month > 0
+            catalog_entry["tap_stream_id"] in self.windowed_objects
+            and self.limit_windowed_objects_month is not None
+            and self.limit_windowed_objects_month > 0
         ):
-            # Calculate the earliest allowed date (limit_tasks_month ago from now)
             now = singer_utils.now()
-            month_limit_date = now - timedelta(days=31 * self.limit_tasks_month)
+            month_limit_date = now - timedelta(days=31 * self.limit_windowed_objects_month)
             month_limit_date_str = month_limit_date.isoformat()
 
-            # Use the later of the two dates (bookmark/default vs month limit)
             if start_date < month_limit_date_str:
                 LOGGER.info(
-                    "Task stream limited to %d months. Using start date %s instead of %s",
-                    self.limit_tasks_month,
+                    "%s stream limited to %d months. Using start date %s instead of %s",
+                    catalog_entry["tap_stream_id"],
+                    self.limit_windowed_objects_month,
                     month_limit_date_str,
                     start_date,
                 )
