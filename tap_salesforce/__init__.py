@@ -24,6 +24,7 @@ from tap_salesforce.salesforce.exceptions import (
 )
 from tap_salesforce import output as tap_output
 from tap_salesforce.observability import (
+    get_tenant_id,
     log_quota_consumed,
     log_quota_status,
     log_sync_complete,
@@ -409,7 +410,19 @@ def pop_deselected_schema(schema, stream_name, breadcrumb, metadata_map):
     for property_name, val in list(schema.get("properties", {}).items()):
         property_breadcrumb = (*list(breadcrumb), "properties", property_name)
         selected = is_property_selected(stream_name, metadata_map, property_breadcrumb)
-        LOGGER.info(stream_name + "." + property_name + " - " + str(selected))
+        LOGGER.info(
+            "%s.%s - %s: %s",
+            stream_name,
+            property_name,
+            selected,
+            json.dumps({
+                "event_type": "schema_field_selection",
+                "tenant_id": get_tenant_id(),
+                "stream": stream_name,
+                "field": property_name,
+                "selected": selected,
+            }),
+        )
         if not selected:
             schema["properties"].pop(property_name)
             continue
