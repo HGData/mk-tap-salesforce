@@ -226,3 +226,113 @@ def log_stream_sync_complete(
     }
 
     LOGGER.info("salesforce_stream_complete: %s", json.dumps(log_data))
+
+
+# The existing `salesforce_quota_consumed` event reports `post_used - pre_used`
+# where pre_used is the Sforce-Limit-Info value on the FIRST response (already
+# past one call), and increments are tracked per HTTP response — NOT per SFDC
+# API call. For the /composite/batch endpoint, one HTTP response corresponds to
+# up to 25 SFDC API calls. Result: our Datadog attribution under-reports MK's
+# true SFDC quota consumption by 100–500× vs. SFDC's own connected-app report.
+#
+# These helpers add two low-level events, intentionally one-per-HTTP-response
+# and one-per-describe-wrapper, so DD can reconstruct authoritative counts
+# without guessing:
+#
+#   salesforce_api_call       — 1 event per _make_request response
+#                               carries endpoint, method, status, duration,
+#                               and the SFDC quota header values.
+#   salesforce_describe_call  — 1 event per describe() wrapper call
+#                               carries composite_subrequest_count so the
+#                               SFDC-side cost (sub-requests, up to 25× the
+#                               HTTP count) is explicit.
+
+_URL_PATH_CACHE_MAX = 1024
+
+
+def _url_path(url: str) -> str:
+    """Extract path from a full SFDC URL for low-cardinality log tagging.
+
+    Drops query strings and the tenant-specific instance host so Datadog facets
+    don't explode. Returns the URL unchanged if it can't be parsed.
+    """
+    if not url:
+        return ""
+    try:
+        # Cheap split — avoids urllib overhead in the request hot path.
+        after_scheme = url.split("://", 1)[-1]
+        after_host = after_scheme.split("/", 1)[-1] if "/" in after_scheme else ""
+        path = "/" + after_host.split("?", 1)[0]
+        return path[:_URL_PATH_CACHE_MAX]
+    except Exception:
+        return url[:_URL_PATH_CACHE_MAX]
+
+
+def log_api_call(
+    sf: "Salesforce",
+    *,
+    method: str,
+    url: str,
+    status_code: int | None,
+    duration_ms: float | None,
+    sforce_limit_used: int | None,
+    sforce_limit_allotted: int | None,
+    response_bytes: int | None = None,
+) -> None:
+    """Emit one structured event per HTTP response through _make_request.
+
+    Intentionally minimal — the hot path runs for every SFDC call. Endpoint
+    classification is left to callers that know the semantics (see
+    `log_describe_call` for the composite/batch case).
+    """
+    log_data = {
+        "event_type": "salesforce_api_call",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tenant_id": get_tenant_id(),
+        "api_type": sf.api_type,
+        "http_method": method,
+        "url_path": _url_path(url),
+        "status_code": status_code,
+        "duration_ms": round(duration_ms, 2) if duration_ms is not None else None,
+        "sforce_limit_used": sforce_limit_used,
+        "sforce_limit_allotted": sforce_limit_allotted,
+        "sforce_percent_used": (
+            round(sforce_limit_used / sforce_limit_allotted * 100, 2)
+            if sforce_limit_used is not None and sforce_limit_allotted
+            else None
+        ),
+        "response_bytes": response_bytes,
+        **_dd_metric("mdi.salesforce.api.http_call", 1, "count"),
+    }
+    LOGGER.info("salesforce_api_call: %s", json.dumps(log_data))
+
+
+def log_describe_call(
+    sf: "Salesforce",
+    *,
+    endpoint_tag: str,
+    subrequest_count: int,
+    duration_ms: float | None,
+    sforce_limit_used: int | None,
+    sforce_limit_allotted: int | None,
+) -> None:
+    """Emit one event per describe() call — critical for closing the composite
+    batch 25× undercount.
+
+    `subrequest_count` is the authoritative SFDC API cost of this call:
+      - 1  for a global describe (sobjects endpoint) or a single-object describe
+      - N  for a /composite/batch with N sub-requests (N ≤ 25)
+    """
+    log_data = {
+        "event_type": "salesforce_describe_call",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tenant_id": get_tenant_id(),
+        "api_type": sf.api_type,
+        "endpoint_tag": endpoint_tag,
+        "subrequest_count": subrequest_count,
+        "duration_ms": round(duration_ms, 2) if duration_ms is not None else None,
+        "sforce_limit_used": sforce_limit_used,
+        "sforce_limit_allotted": sforce_limit_allotted,
+        **_dd_metric("mdi.salesforce.api.describe_cost", subrequest_count, "count"),
+    }
+    LOGGER.info("salesforce_describe_call: %s", json.dumps(log_data))

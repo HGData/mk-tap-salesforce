@@ -139,9 +139,11 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
         LOGGER.info("Start discovery for all streams")
         global_description = sf.describe()
         objects_to_discover = {o["name"] for o in global_description["sobjects"]}
+        describe_calls_issued = 1
     else:
         LOGGER.info(f"Start discovery: {streams=}")
         objects_to_discover = streams
+        describe_calls_issued = 0
 
     key_properties = ["Id"]
 
@@ -169,6 +171,7 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
     entries = []
     for batch in sobject_batches:
         sobject_descriptions = sf.describe(batch)
+        describe_calls_issued += 1
 
         for subrequest_result in sobject_descriptions:
             sobject_description = subrequest_result["result"]
@@ -319,6 +322,21 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
         entries = [e for e in entries if e["stream"] not in unsupported_tag_objects]
 
     result = {"streams": entries}
+
+    # Structured log so DD can count discovery runs per tenant and
+    # match SFDC's /limits view (closes the ~14× undercount in the MDI API Quotas
+    # dashboard). Emitted once per discovery invocation.
+    LOGGER.info(
+        "salesforce_discovery_complete: %s",
+        json.dumps({
+            "event_type": "salesforce_discovery_complete",
+            "tenant_id": CONFIG.get("tenant_id"),
+            "streams_requested": len(streams) if streams else 0,
+            "streams_discovered": len(entries),
+            "describe_calls_issued": describe_calls_issued,
+        }),
+    )
+
     json.dump(result, sys.stdout, indent=4)
 
 
