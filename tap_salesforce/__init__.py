@@ -24,6 +24,7 @@ from tap_salesforce.salesforce.exceptions import (
 )
 from tap_salesforce import output as tap_output
 from tap_salesforce.observability import (
+    emit_discovery_summary_metric,
     log_quota_consumed,
     log_quota_status,
     log_sync_complete,
@@ -323,9 +324,20 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
 
     result = {"streams": entries}
 
-    # Structured log so DD can count discovery runs per tenant and
-    # match SFDC's /limits view (closes the ~14× undercount in the MDI API Quotas
-    # dashboard). Emitted once per discovery invocation.
+    # CPF-1874: emit dogstatsd metrics directly to the DD agent over UDP. This
+    # path bypasses Meltano's discover-subprocess stderr capture, so the metrics
+    # reach DD even though the structured log below is silently swallowed when
+    # do_discover runs as a Meltano child process (the original blind spot — the
+    # `LOGGER.info` discover events were never visible in DD because Meltano
+    # consumes the discover subprocess's stderr instead of forwarding it).
+    emit_discovery_summary_metric(
+        describe_calls_issued=describe_calls_issued,
+        streams_discovered=len(entries),
+    )
+
+    # Structured log retained for richer fields (tenant_id, streams_requested);
+    # surfaces in DD Logs when stderr IS forwarded (e.g. invocations outside
+    # Meltano's run-mode pipeline).
     LOGGER.info(
         "salesforce_discovery_complete: %s",
         json.dumps({

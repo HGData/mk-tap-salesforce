@@ -336,3 +336,109 @@ def log_describe_call(
         **_dd_metric("mdi.salesforce.api.describe_cost", subrequest_count, "count"),
     }
     LOGGER.info("salesforce_describe_call: %s", json.dumps(log_data))
+
+
+# ---------------------------------------------------------------------------
+# CPF-1874 — Dogstatsd UDP emission for the discover phase
+# ---------------------------------------------------------------------------
+#
+# Discover runs as a Meltano subprocess whose stderr is captured by Meltano,
+# not forwarded to the container's stderr → CloudWatch → Datadog Logs pipeline.
+# Result: every `LOGGER.info(...)` from `do_discover` and from `describe()`
+# during the discover phase is invisible in DD Logs and the dashboard widgets
+# built on log-based metrics. This was the entire describe-storm blind spot.
+#
+# Fix: emit metrics over UDP directly to the DD agent (sidecar in the same
+# Fargate task at localhost:8125 by default). UDP packets bypass Meltano's
+# pipe capture entirely and reach DD via the agent's standard dogstatsd path.
+#
+# These helpers are best-effort: we never raise from telemetry. If the socket
+# call fails (agent not running locally, port closed, etc.) the tap continues
+# normally and we lose the data point — exactly the right trade-off.
+
+import socket as _socket  # noqa: E402
+
+
+def _dogstatsd_endpoint() -> tuple[str, int]:
+    """Datadog agent dogstatsd endpoint per Fargate sidecar convention."""
+    host = os.environ.get("DD_AGENT_HOST", "localhost")
+    try:
+        port = int(os.environ.get("DD_DOGSTATSD_PORT", "8125"))
+    except (TypeError, ValueError):
+        port = 8125
+    return host, port
+
+
+def _dogstatsd_send(line: bytes) -> None:
+    """Best-effort UDP send. Swallows every exception — telemetry must not break the tap."""
+    try:
+        host, port = _dogstatsd_endpoint()
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(0.05)  # 50ms — agent is local; if slower, give up
+            sock.sendto(line, (host, port))
+        finally:
+            sock.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _format_tags(tags: dict[str, str | int | None]) -> str:
+    parts = [f"{k}:{v}" for k, v in tags.items() if v is not None and v != ""]
+    return ("|#" + ",".join(parts)) if parts else ""
+
+
+def dogstatsd_count(name: str, value: int | float, tags: dict | None = None) -> None:
+    """Emit a counter metric directly to the DD agent over UDP."""
+    line = f"{name}:{value}|c{_format_tags(tags or {})}".encode("utf-8")
+    _dogstatsd_send(line)
+
+
+def dogstatsd_gauge(name: str, value: int | float, tags: dict | None = None) -> None:
+    """Emit a gauge metric directly to the DD agent over UDP."""
+    line = f"{name}:{value}|g{_format_tags(tags or {})}".encode("utf-8")
+    _dogstatsd_send(line)
+
+
+def emit_describe_call_metric(
+    *,
+    endpoint_tag: str,
+    subrequest_count: int,
+) -> None:
+    """Per-describe-call counter. Fires from inside `Salesforce.describe()`.
+
+    Survives Meltano's discover-subprocess stderr capture because UDP to the
+    DD agent is independent of any stdio pipeline.
+
+    Sum `mdi.salesforce.api.describe_calls.cost` for authoritative SFDC
+    describe-cost attribution per tenant — matches what SFDC's connected-app
+    "API Usage Last 7 Days" report counts.
+    """
+    tenant_id = get_tenant_id()
+    tags = {
+        "tenant_id": tenant_id,
+        "endpoint_tag": endpoint_tag,
+    }
+    # Number of describe HTTP responses (1 per wrapper call)
+    dogstatsd_count("mdi.salesforce.api.describe_calls.responses", 1, tags)
+    # SFDC-billed cost (1 for single, up to 25 for /composite/batch)
+    dogstatsd_count("mdi.salesforce.api.describe_calls.cost", subrequest_count, tags)
+
+
+def emit_discovery_summary_metric(
+    *,
+    describe_calls_issued: int,
+    streams_discovered: int,
+) -> None:
+    """Per-do_discover() summary metrics. Fires once per discover invocation.
+
+    `describe_calls_issued` counts HTTP responses (composite batches + global).
+    Multiply by ~25 for typical full-org discover to estimate SFDC-side cost,
+    OR sum `mdi.salesforce.api.describe_calls.cost` from `emit_describe_call_metric`
+    for the exact figure.
+    """
+    tenant_id = get_tenant_id()
+    tags = {"tenant_id": tenant_id}
+    dogstatsd_count("mdi.salesforce.api.discovery_runs", 1, tags)
+    dogstatsd_count("mdi.salesforce.api.discovery_describes", describe_calls_issued, tags)
+    dogstatsd_gauge("mdi.salesforce.api.streams_discovered", streams_discovered, tags)

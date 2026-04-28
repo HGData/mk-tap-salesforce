@@ -9,6 +9,7 @@ import singer.utils as singer_utils
 from singer import metadata, metrics
 
 from tap_salesforce.observability import (
+    emit_describe_call_metric,
     log_api_call,
     log_describe_call,
     log_quota_status,
@@ -464,6 +465,14 @@ class Salesforce:
             duration_ms=describe_duration_ms,
             sforce_limit_used=self._latest_quota_used,
             sforce_limit_allotted=self._latest_quota_allotted,
+        )
+        # CPF-1874: also emit a UDP dogstatsd counter so the metric reaches DD
+        # even when this call happens inside Meltano's discover subprocess (whose
+        # stderr is captured by Meltano and never reaches CloudWatch). The log
+        # above is preserved for richer fields when stderr IS forwarded (sync phase).
+        emit_describe_call_metric(
+            endpoint_tag=endpoint_tag,
+            subrequest_count=subrequest_count,
         )
 
         if isinstance(sobject, list):
