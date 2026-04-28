@@ -357,6 +357,33 @@ def log_describe_call(
 # normally and we lose the data point — exactly the right trade-off.
 
 import socket as _socket  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+# Tracks which tap phase is active so describe-cost metrics can be tagged
+# `phase:discover` vs `phase:sync`. Discover and sync may both call
+# `Salesforce.describe()`; without this tag the dashboard collapses both into
+# one bar and the two distinct waves per Airflow run are indistinguishable.
+_current_phase: str = "sync"
+
+
+def set_phase(phase: str) -> None:
+    """Set the active tap phase. Read by `emit_describe_call_metric`."""
+    global _current_phase
+    _current_phase = phase
+
+
+def get_phase() -> str:
+    return _current_phase
+
+
+@contextmanager
+def phase_context(phase: str):
+    previous = _current_phase
+    set_phase(phase)
+    try:
+        yield
+    finally:
+        set_phase(previous)
 
 
 def _dogstatsd_endpoint() -> tuple[str, int]:
@@ -418,6 +445,7 @@ def emit_describe_call_metric(
     tags = {
         "tenant_id": tenant_id,
         "endpoint_tag": endpoint_tag,
+        "phase": get_phase(),
     }
     # Number of describe HTTP responses (1 per wrapper call)
     dogstatsd_count("mdi.salesforce.api.describe_calls.responses", 1, tags)

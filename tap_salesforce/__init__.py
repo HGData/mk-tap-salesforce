@@ -24,11 +24,14 @@ from tap_salesforce.salesforce.exceptions import (
 )
 from tap_salesforce import output as tap_output
 from tap_salesforce.observability import (
+    dogstatsd_count,
     emit_discovery_summary_metric,
+    get_tenant_id,
     log_quota_consumed,
     log_quota_status,
     log_sync_complete,
     log_sync_start,
+    set_phase,
 )
 from tap_salesforce.sync import (
     get_stream_version,
@@ -134,7 +137,26 @@ def create_property_schema(field, mdata):
     return (property_schema, mdata)
 
 
-def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
+def do_discover(sf: Salesforce, streams: list[str]):
+    """Wrapper around `_do_discover_impl` that surfaces exceptions via dogstatsd.
+
+    Meltano captures the discover subprocess's stderr, so a raised exception is
+    invisible in DD Logs. Emit a tagged counter so failure mode shows up on the
+    dashboard even when the traceback is swallowed by Meltano.
+    """
+    set_phase("discover")
+    try:
+        _do_discover_impl(sf, streams)
+    except Exception as e:
+        dogstatsd_count(
+            "mdi.salesforce.api.discovery_errors",
+            1,
+            {"tenant_id": get_tenant_id(), "error_type": type(e).__name__},
+        )
+        raise
+
+
+def _do_discover_impl(sf: Salesforce, streams: list[str]):  # noqa: C901
     if not streams:
         """Describes a Salesforce instance's objects and generates a JSON schema for each field."""
         LOGGER.info("Start discovery for all streams")
@@ -521,6 +543,7 @@ async def sync_catalog_entry(sf, catalog_entry, state):
 
 
 def do_sync(sf, catalog, state):
+    set_phase("sync")
     LOGGER.info("Starting sync")
 
     max_workers = CONFIG.get("max_workers", 8)
