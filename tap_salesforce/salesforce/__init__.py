@@ -8,7 +8,12 @@ import singer
 import singer.utils as singer_utils
 from singer import metadata, metrics
 
-from tap_salesforce.observability import log_quota_status
+from tap_salesforce.observability import (
+    emit_describe_call_metric,
+    log_api_call,
+    log_describe_call,
+    log_quota_status,
+)
 from tap_salesforce.salesforce.bulk import Bulk
 from tap_salesforce.salesforce.bulk2 import Bulk2
 from tap_salesforce.salesforce.credentials import SalesforceAuth
@@ -357,6 +362,10 @@ class Salesforce:
         on_backoff=log_backoff_attempt,
     )
     def _make_request(self, http_method, url, headers=None, body=None, stream=False, params=None):
+        # Capture the request start for duration + per-call observability.
+        # Kept as close to the wire call as possible so the timer measures actual
+        # network + SFDC latency, not any bookkeeping.
+        request_start = singer_utils.now()
         if http_method == "GET":
             LOGGER.info("Making %s request to %s with params: %s", http_method, url, params)
             resp = self.session.get(url, headers=headers, stream=stream, params=params)
@@ -365,12 +374,43 @@ class Salesforce:
             resp = self.session.post(url, headers=headers, data=body)
         else:
             raise TapSalesforceExceptionError("Unsupported HTTP method")
+        duration_ms = (singer_utils.now() - request_start).total_seconds() * 1000.0
 
         raise_for_status(resp)
 
-        if resp.headers.get("Sforce-Limit-Info") is not None:
+        limit_used: int | None = None
+        limit_allotted: int | None = None
+        limit_header = resp.headers.get("Sforce-Limit-Info")
+        if limit_header is not None:
             self.rest_requests_attempted += 1
+            match = re.search(r"^api-usage=(\d+)/(\d+)$", limit_header)
+            if match:
+                limit_used, limit_allotted = (int(match.group(1)), int(match.group(2)))
             self.check_rest_quota_usage(resp.headers)
+
+        # Per-HTTP-response event so DD can count calls by url_path
+        # and track the authoritative SFDC counter across the whole run, not just
+        # the pre/post pair. Only fires when Sforce-Limit-Info is present to avoid
+        # logging non-quota-bearing calls (auth, streaming chunks) separately.
+        if limit_header is not None:
+            try:
+                response_bytes = (
+                    int(resp.headers.get("Content-Length", 0))
+                    if resp.headers.get("Content-Length")
+                    else None
+                )
+            except (TypeError, ValueError):
+                response_bytes = None
+            log_api_call(
+                self,
+                method=http_method,
+                url=url,
+                status_code=resp.status_code,
+                duration_ms=duration_ms,
+                sforce_limit_used=limit_used,
+                sforce_limit_allotted=limit_allotted,
+                response_bytes=response_bytes,
+            )
 
         return resp
 
@@ -405,9 +445,35 @@ class Salesforce:
             endpoint_tag = sobject
             url = self.data_url.format(instance_url, endpoint)
 
+        # Capture the SFDC-side cost of this describe call separately
+        # from the HTTP call count. For /composite/batch the SFDC cost = number of
+        # subrequests (up to 25), which is why rest_requests_attempted was under-
+        # reporting by ~25× every discovery batch.
+        subrequest_count = len(sobject) if isinstance(sobject, list) else 1
+        describe_start = singer_utils.now()
         with metrics.http_request_timer("describe") as timer:
             timer.tags["endpoint"] = endpoint_tag
             resp = self._make_request(method, url, headers=headers, body=body)
+        describe_duration_ms = (singer_utils.now() - describe_start).total_seconds() * 1000.0
+
+        # Pull the limit state captured by _make_request for this same response.
+        # _latest_quota_used is updated inside check_rest_quota_usage above.
+        log_describe_call(
+            self,
+            endpoint_tag=endpoint_tag,
+            subrequest_count=subrequest_count,
+            duration_ms=describe_duration_ms,
+            sforce_limit_used=self._latest_quota_used,
+            sforce_limit_allotted=self._latest_quota_allotted,
+        )
+        # CPF-1874: also emit a UDP dogstatsd counter so the metric reaches DD
+        # even when this call happens inside Meltano's discover subprocess (whose
+        # stderr is captured by Meltano and never reaches CloudWatch). The log
+        # above is preserved for richer fields when stderr IS forwarded (sync phase).
+        emit_describe_call_metric(
+            endpoint_tag=endpoint_tag,
+            subrequest_count=subrequest_count,
+        )
 
         if isinstance(sobject, list):
             return resp.json()["results"]

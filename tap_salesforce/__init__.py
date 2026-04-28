@@ -24,10 +24,14 @@ from tap_salesforce.salesforce.exceptions import (
 )
 from tap_salesforce import output as tap_output
 from tap_salesforce.observability import (
+    dogstatsd_count,
+    emit_discovery_summary_metric,
+    get_tenant_id,
     log_quota_consumed,
     log_quota_status,
     log_sync_complete,
     log_sync_start,
+    set_phase,
 )
 from tap_salesforce.sync import (
     get_stream_version,
@@ -133,15 +137,36 @@ def create_property_schema(field, mdata):
     return (property_schema, mdata)
 
 
-def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
+def do_discover(sf: Salesforce, streams: list[str]):
+    """Wrapper around `_do_discover_impl` that surfaces exceptions via dogstatsd.
+
+    Meltano captures the discover subprocess's stderr, so a raised exception is
+    invisible in DD Logs. Emit a tagged counter so failure mode shows up on the
+    dashboard even when the traceback is swallowed by Meltano.
+    """
+    set_phase("discover")
+    try:
+        _do_discover_impl(sf, streams)
+    except Exception as e:
+        dogstatsd_count(
+            "mdi.salesforce.api.discovery_errors",
+            1,
+            {"tenant_id": get_tenant_id(), "error_type": type(e).__name__},
+        )
+        raise
+
+
+def _do_discover_impl(sf: Salesforce, streams: list[str]):  # noqa: C901
     if not streams:
         """Describes a Salesforce instance's objects and generates a JSON schema for each field."""
         LOGGER.info("Start discovery for all streams")
         global_description = sf.describe()
         objects_to_discover = {o["name"] for o in global_description["sobjects"]}
+        describe_calls_issued = 1
     else:
         LOGGER.info(f"Start discovery: {streams=}")
         objects_to_discover = streams
+        describe_calls_issued = 0
 
     key_properties = ["Id"]
 
@@ -169,6 +194,7 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
     entries = []
     for batch in sobject_batches:
         sobject_descriptions = sf.describe(batch)
+        describe_calls_issued += 1
 
         for subrequest_result in sobject_descriptions:
             sobject_description = subrequest_result["result"]
@@ -319,6 +345,32 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
         entries = [e for e in entries if e["stream"] not in unsupported_tag_objects]
 
     result = {"streams": entries}
+
+    # CPF-1874: emit dogstatsd metrics directly to the DD agent over UDP. This
+    # path bypasses Meltano's discover-subprocess stderr capture, so the metrics
+    # reach DD even though the structured log below is silently swallowed when
+    # do_discover runs as a Meltano child process (the original blind spot — the
+    # `LOGGER.info` discover events were never visible in DD because Meltano
+    # consumes the discover subprocess's stderr instead of forwarding it).
+    emit_discovery_summary_metric(
+        describe_calls_issued=describe_calls_issued,
+        streams_discovered=len(entries),
+    )
+
+    # Structured log retained for richer fields (tenant_id, streams_requested);
+    # surfaces in DD Logs when stderr IS forwarded (e.g. invocations outside
+    # Meltano's run-mode pipeline).
+    LOGGER.info(
+        "salesforce_discovery_complete: %s",
+        json.dumps({
+            "event_type": "salesforce_discovery_complete",
+            "tenant_id": CONFIG.get("tenant_id"),
+            "streams_requested": len(streams) if streams else 0,
+            "streams_discovered": len(entries),
+            "describe_calls_issued": describe_calls_issued,
+        }),
+    )
+
     json.dump(result, sys.stdout, indent=4)
 
 
@@ -491,6 +543,7 @@ async def sync_catalog_entry(sf, catalog_entry, state):
 
 
 def do_sync(sf, catalog, state):
+    set_phase("sync")
     LOGGER.info("Starting sync")
 
     max_workers = CONFIG.get("max_workers", 8)
