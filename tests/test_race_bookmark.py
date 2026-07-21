@@ -304,7 +304,7 @@ class TestBookmarkLoading:
 
         # Mock Salesforce instance
         mock_sf = MagicMock()
-        mock_sf.pk_chunking = False
+        mock_sf.is_pk_chunking.return_value = False
         mock_sf.query.return_value = [
             {
                 "Id": "001",

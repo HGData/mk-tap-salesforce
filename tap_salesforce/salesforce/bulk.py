@@ -7,7 +7,7 @@ import time
 
 import singer
 import xmltodict
-from requests.exceptions import RequestException
+from requests.exceptions import HTTPError, RequestException
 from singer import metrics
 
 from tap_salesforce import output as tap_output
@@ -22,6 +22,19 @@ ITER_CHUNK_SIZE = 1024
 DEFAULT_CHUNK_SIZE = 50000
 
 LOGGER = singer.get_logger()
+
+
+def _error_code(response):
+    """Best-effort extraction of the Salesforce errorCode from an error response."""
+    try:
+        body = response.json()
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(body, list) and body and isinstance(body[0], dict):
+        return body[0].get("errorCode")
+    if isinstance(body, dict):
+        return body.get("errorCode")
+    return None
 
 
 # pylint: disable=inconsistent-return-statements
@@ -61,8 +74,25 @@ class Bulk:
         endpoint = "limits"
         url = self.sf.data_url.format(self.sf.instance_url, endpoint)
 
-        with metrics.http_request_timer(endpoint):
-            resp = self.sf._make_request("GET", url, headers=self.sf.auth.rest_headers).json()
+        try:
+            with metrics.http_request_timer(endpoint):
+                resp = self.sf._make_request("GET", url, headers=self.sf.auth.rest_headers).json()
+        except HTTPError as ex:
+            # Some orgs have the /limits resource disabled (API_DISABLED_FOR_ORG,
+            # delivered as HTTP 403). The quota check is best-effort, so skip it
+            # rather than failing the whole sync when limits are unreadable. The REST
+            # path never hit this because it does not call /limits.
+            #
+            # Match only this specific errorCode, NOT any 403: other 403s
+            # (REQUEST_LIMIT_EXCEEDED, INSUFFICIENT_ACCESS, ...) are real problems that
+            # should surface rather than silently proceed into a Bulk job.
+            if _error_code(ex.response) == "API_DISABLED_FOR_ORG":
+                LOGGER.warning(
+                    "Skipping Bulk API quota pre-check: /limits disabled for org "
+                    "(API_DISABLED_FOR_ORG). Proceeding without it."
+                )
+                return
+            raise
 
         quota_max = resp["DailyBulkApiBatches"]["Max"]
         max_requests_for_run = int((self.sf.quota_percent_per_run * quota_max) / 100)
@@ -119,8 +149,8 @@ class Bulk:
                 batch_status = self._bulk_query_with_pk_chunking(catalog_entry, start_date)
                 job_id = batch_status["job_id"]
 
-                # Set pk_chunking to True to indicate that we should write a bookmark differently
-                self.sf.pk_chunking = True
+                # Mark this stream as PK-chunking so sync writes its bookmark differently
+                self.sf.mark_pk_chunking(catalog_entry["tap_stream_id"])
 
                 # Add the bulk Job ID and its batches to the state so it can be resumed if necessary
                 tap_stream_id = catalog_entry["tap_stream_id"]
