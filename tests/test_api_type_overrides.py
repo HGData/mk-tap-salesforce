@@ -35,6 +35,7 @@ def make_sf(api_type=REST_API_TYPE, api_type_overrides=None):
     sf = Salesforce.__new__(Salesforce)
     sf.api_type = api_type
     sf.api_type_overrides = Salesforce._normalize_api_type_overrides(api_type_overrides)
+    sf._pk_chunking_streams = set()
     return sf
 
 
@@ -109,13 +110,21 @@ class TestQueryRouting:
             mock_rest.assert_called_once_with(sf)
             mock_bulk.assert_not_called()
 
-    def test_query_resets_pk_chunking(self):
+    def test_query_clears_stale_pk_chunking_mark(self):
         sf = make_sf()
-        sf.pk_chunking = True
+        sf.mark_pk_chunking("Lead")
         with patch("tap_salesforce.salesforce.Rest") as mock_rest:
             mock_rest.return_value.query.return_value = iter([])
             list(sf.query(catalog_entry("Lead"), {}))
-        assert sf.pk_chunking is False
+        assert sf.is_pk_chunking("Lead") is False
+
+    def test_pk_chunking_is_tracked_per_stream(self):
+        # One stream chunking must not leak to a concurrent stream (do_sync runs
+        # all streams against one shared Salesforce instance).
+        sf = make_sf()
+        sf.mark_pk_chunking("Task")
+        assert sf.is_pk_chunking("Task") is True
+        assert sf.is_pk_chunking("Lead") is False
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +252,11 @@ class TestErrorCode:
     def test_none_on_unparseable(self):
         resp = Mock()
         resp.json.side_effect = ValueError("no json")
+        assert _error_code(resp) is None
+
+    def test_none_on_list_of_non_dicts(self):
+        resp = Mock()
+        resp.json.return_value = ["oops"]
         assert _error_code(resp) is None
 
 

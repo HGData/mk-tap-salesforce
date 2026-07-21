@@ -30,7 +30,7 @@ def _error_code(response):
         body = response.json()
     except (ValueError, AttributeError):
         return None
-    if isinstance(body, list) and body:
+    if isinstance(body, list) and body and isinstance(body[0], dict):
         return body[0].get("errorCode")
     if isinstance(body, dict):
         return body.get("errorCode")
@@ -149,8 +149,8 @@ class Bulk:
                 batch_status = self._bulk_query_with_pk_chunking(catalog_entry, start_date)
                 job_id = batch_status["job_id"]
 
-                # Set pk_chunking to True to indicate that we should write a bookmark differently
-                self.sf.pk_chunking = True
+                # Mark this stream as PK-chunking so sync writes its bookmark differently
+                self.sf.mark_pk_chunking(catalog_entry["tap_stream_id"])
 
                 # Add the bulk Job ID and its batches to the state so it can be resumed if necessary
                 tap_stream_id = catalog_entry["tap_stream_id"]

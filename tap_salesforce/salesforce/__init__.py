@@ -264,7 +264,11 @@ class Salesforce:
         self.rest_requests_attempted = 0
         self.jobs_completed = 0
         self.data_url = "{}/services/data/v60.0/{}"
-        self.pk_chunking = False
+        # PK-chunking is tracked per stream, not as a single flag: do_sync runs all
+        # streams concurrently against this shared Salesforce instance, so a global
+        # flag set by one stream's Bulk sync would corrupt the end-of-stream bookmark
+        # logic of any concurrent REST stream (and vice versa).
+        self._pk_chunking_streams = set()
 
         # Quota tracking for before/after extraction monitoring
         self._initial_quota_used = None
@@ -681,11 +685,18 @@ class Salesforce:
         """Resolve the api_type for a stream, honoring per-stream overrides."""
         return self.api_type_overrides.get(stream.lower(), self.api_type)
 
+    def mark_pk_chunking(self, tap_stream_id):
+        """Record that a stream is being synced via Bulk PK chunking (per stream so it
+        is safe under the concurrent stream syncs in do_sync)."""
+        self._pk_chunking_streams.add(tap_stream_id)
+
+    def is_pk_chunking(self, tap_stream_id):
+        return tap_stream_id in self._pk_chunking_streams
+
     def query(self, catalog_entry, state):
-        # Reset per stream: the Bulk path sets pk_chunking mid-iteration and sync
-        # reads it afterwards to change bookmark handling. Without resetting here it
-        # would leak to later REST streams and corrupt their bookmarks.
-        self.pk_chunking = False
+        # Clear any stale PK-chunking mark for this stream before querying; the Bulk
+        # path re-marks it mid-iteration if it chunks.
+        self._pk_chunking_streams.discard(catalog_entry["tap_stream_id"])
         api_type = self.effective_api_type(catalog_entry["stream"])
         if api_type == BULK_API_TYPE:
             bulk = Bulk(self)
