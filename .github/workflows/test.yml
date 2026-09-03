@@ -16,4 +16,4 @@ jobs:
       - name: Install dependencies
         run: pip install pytest pytest-mock requests simple_salesforce
       - name: Run tests
-        run: pytest tests/test_credentials.py -v
+        run: pytest tests/test_credentials.py tests/test_row_filter.py -v
