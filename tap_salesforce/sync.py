@@ -116,6 +116,55 @@ def sync_stream(sf, catalog_entry, state, state_msg_threshold):
             raise Exception(f"Error syncing {stream}: {ex}") from ex
 
 
+def empty_filtered_window(sf, catalog_entry, counter, replication_key):
+    """Whether a row filter narrowed this stream's window and nothing came back.
+
+    The bookmark only ever advances to the replication key of a record that was
+    returned, so a window admitting no rows leaves it where it was: the next run
+    re-issues the same `>= bookmark` query over a range one cycle wider, and keeps
+    widening until Salesforce refuses it. The legacy puller instead advances to the end
+    of the window it asked for and moves past empty windows, which is the behaviour to
+    match here.
+
+    Only filtered streams qualify. On an unfiltered stream an empty window means
+    nothing was modified, which leaving the bookmark alone already handles correctly;
+    advancing it there would change every stream's behaviour to fix a problem only a
+    filter can create.
+    """
+    return counter.value == 0 and bool(replication_key) and sf.has_row_filter(catalog_entry)
+
+
+def write_window_end_bookmark(state, catalog_entry, replication_key, start_time):
+    """Advance the bookmark to the moment the query was issued.
+
+    `start_time` is read before the query goes out, so it is never later than anything
+    the query could have returned.
+
+    It is a reading of our clock rather than a value Salesforce handed back, which is
+    the one way this differs from the has-records path. A record whose replication key
+    lands at or before `start_time` but which Salesforce had not yet made visible when
+    the query ran would be skipped for good, and clock skew between this host and the
+    org widens that window. The alternative is a stream whose cursor never moves again
+    and whose scanned range grows every run, so this is the better of two exposures --
+    and it is the same trade the legacy puller makes by advancing to the end of the
+    window it requested.
+    """
+    from tap_salesforce import CONFIG
+
+    stream = catalog_entry["stream"]
+    return singer.write_bookmark(
+        state,
+        catalog_entry["tap_stream_id"],
+        replication_key,
+        tap_output.safe_bookmark_value(
+            stream,
+            replication_key,
+            singer_utils.strftime(start_time),
+            max_future_seconds=CONFIG.get("max_future_bookmark_seconds", 3600),
+        ),
+    )
+
+
 def sync_records(sf, catalog_entry, state, counter, state_msg_threshold):
     from tap_salesforce import CONFIG
 
@@ -182,6 +231,19 @@ def sync_records(sf, catalog_entry, state, counter, state_msg_threshold):
 
             if counter.value % state_msg_threshold == 0:
                 tap_output.write_state(state)
+
+    if empty_filtered_window(sf, catalog_entry, counter, replication_key):
+        LOGGER.info(
+            "Filtered window for %s returned no rows; advancing bookmark to %s so the "
+            "scanned range does not grow on the next run",
+            stream,
+            singer_utils.strftime(start_time),
+        )
+        # A PK-chunked stream writes its bookmark from chunked_bookmark at the end of
+        # the stream, so that is set too. Both writes produce the same value, which is
+        # why this does not need to know which path it is on.
+        chunked_bookmark = start_time
+        state = write_window_end_bookmark(state, catalog_entry, replication_key, start_time)
 
     # Tables with no replication_key will send an
     # activate_version message for the next sync

@@ -34,6 +34,24 @@ BULK_API_TYPE = "BULK"
 BULK2_API_TYPE = "BULK2"
 REST_API_TYPE = "REST"
 
+# A syntactic tripwire on the per-object row filter, not a validator. mk-data-api
+# parses the predicate and re-emits it from a grammar before it gets here, and that
+# remains the contract; these checks exist only to make a defect on that path loud
+# rather than to police free text the tap does not own.
+#
+# Length is advisory. The real cap lives in mk-data-api, and raising it there must not
+# stop a tenant's extract here, so an over-long filter is logged and used: it is a
+# request-size risk, not a correctness one.
+MAX_ROW_FILTER_LENGTH = 1000
+# Punctuation that never appears in a predicate outside a quoted value.
+FORBIDDEN_ROW_FILTER_TOKENS = (";", "--", "/*")
+# Matched on a word boundary rather than as a substring, so a subquery separated by a
+# tab or a newline cannot slip past a hardcoded space.
+FORBIDDEN_ROW_FILTER_KEYWORDS = re.compile(r"\bSELECT\b")
+# A SOQL single-quoted literal, escapes included. Masked out before the checks above
+# so they read a predicate's syntax without reading the values inside it.
+QUOTED_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'")
+
 STRING_TYPES = {
     "id",
     "string",
@@ -295,21 +313,158 @@ class Salesforce:
                 default_start_date,
             )
 
-    def _parse_objects_config(self, objects_config: str | list[dict], stream: str) -> list[str]:
-        """Parse the OBJECTS configuration string into a list of fields for the given stream."""
-        if not objects_config or not stream:
-            return []
+    def _object_config_list(self, objects_config: str | list[dict]) -> list:
+        """Parse the objects config, once per instance.
+
+        The config does not change during a run, but the query builder rebuilds its
+        query on every REST bisection step and every resume, and both the field list
+        and the row filter read it. Parsing it each time re-walks a document carrying
+        every selected field name for every object.
+        """
+        cached = getattr(self, "_objects_config_cache", None)
+        if cached is not None and cached[0] is objects_config:
+            return cached[1]
 
         try:
-            objects_list = json.loads(objects_config) if isinstance(objects_config, str) else objects_config
-
-            for obj in objects_list:
-                if isinstance(obj, dict) and obj.get('name', '').lower() == stream.lower():
-                    return obj.get('columns', [])
-            return []
-        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            parsed = json.loads(objects_config) if isinstance(objects_config, str) else objects_config
+        except (json.JSONDecodeError, TypeError) as e:
             LOGGER.warning(f"Failed to parse OBJECTS configuration: {e}")
-            return []
+            parsed = []
+
+        self._objects_config_cache = (objects_config, parsed)
+        return parsed
+
+    def _find_object_config(self, objects_config: str | list[dict], stream: str) -> dict | None:
+        """Find the pull-config entry for the given stream, or None."""
+        if not objects_config or not stream:
+            return None
+
+        try:
+            for obj in self._object_config_list(objects_config):
+                if isinstance(obj, dict) and obj.get('name', '').lower() == stream.lower():
+                    return obj
+            return None
+        except (TypeError, KeyError) as e:
+            LOGGER.warning(f"Failed to parse OBJECTS configuration: {e}")
+            return None
+
+    def _parse_objects_config(self, objects_config: str | list[dict], stream: str) -> list[str]:
+        """Parse the OBJECTS configuration string into a list of fields for the given stream."""
+        obj = self._find_object_config(objects_config, stream)
+        return obj.get('columns', []) if obj else []
+
+    def _parse_object_conditions(self, objects_config: str | list[dict], stream: str) -> str | None:
+        """Return the row filter the pull config carries for the given stream, or None."""
+        obj = self._find_object_config(objects_config, stream)
+        if not obj:
+            return None
+        conditions = obj.get('conditions')
+        return conditions if isinstance(conditions, str) and conditions.strip() else None
+
+    def _validate_row_filter(self, stream: str, conditions: str) -> None:
+        """Refuse a row filter that does not look like the predicate we were promised.
+
+        The pull config is built by mk-data-api, which parses the tenant's filter and
+        re-emits it from the parse tree, so anything reaching here has already been
+        through a grammar. This is the second line: the only way a value gets past that
+        and still trips these checks is a defect or a tampered config, and in either
+        case the safe move is to stop rather than to run the query.
+
+        Stopping is deliberate. Dropping the filter and extracting anyway would admit
+        exactly the records the tenant asked to exclude, silently, which is the failure
+        this whole feature exists to prevent. A raised error costs the run instead, and
+        the run is safe to retry: no bookmark is ever written ahead of a record that
+        came back, so the next run re-reads the same window with no gap.
+        """
+        if len(conditions) > MAX_ROW_FILTER_LENGTH:
+            LOGGER.warning(
+                "Row filter for %s is %d characters, over the %d the tap expects. Using it anyway: "
+                "the limit belongs to the config service, and a longer filter is a request-size "
+                "risk rather than a wrong one.",
+                stream,
+                len(conditions),
+                MAX_ROW_FILTER_LENGTH,
+            )
+
+        # Quoted values are masked to a space first. These tokens are only dangerous as
+        # syntax; inside a literal they are ordinary data, and companies really are
+        # called things like "Select Comfort" or "Smith--Jones". Scanning the raw text
+        # would reject a filter the config service had already approved. A space rather
+        # than an empty string so masking cannot fuse two neighbours into a new token.
+        syntax = QUOTED_LITERAL.sub(" ", conditions).upper()
+        if "'" in syntax:
+            raise TapSalesforceExceptionError(
+                f"Row filter for {stream} has an unterminated quoted value, "
+                "so the rest of the predicate cannot be read"
+            )
+        for forbidden in FORBIDDEN_ROW_FILTER_TOKENS:
+            if forbidden in syntax:
+                raise TapSalesforceExceptionError(
+                    f"Row filter for {stream} contains {forbidden!r} outside a quoted value, "
+                    "which is not a valid predicate"
+                )
+        if FORBIDDEN_ROW_FILTER_KEYWORDS.search(syntax):
+            raise TapSalesforceExceptionError(
+                f"Row filter for {stream} contains a subquery outside a quoted value, "
+                "which is not a valid predicate"
+            )
+
+    def get_row_filter(self, catalog_entry):
+        """Build the SOQL predicate to AND onto this stream's query, or None.
+
+        Wrapped in parentheses here as well as by the config service, because the
+        caller appends it to a replication-key window with a bare AND and must not
+        depend on the shape of a value it did not emit.
+
+        Soft-deleted records are exempted from the filter. A deletion only ever reaches
+        us as IsDeleted on a row the query returned, and the merge downstream is
+        upsert-only, so a record that leaves the filter's cohort and is then deleted in
+        Salesforce would keep its stale IsDeleted value for good. Exempting the flag
+        means the deletion always arrives.
+
+        Task is usually left out of that exemption: it is the one stream the REST and
+        Bulk paths query through the endpoint that excludes soft-deleted rows, so its
+        deleted Activity records stay out of the distinct-who/what ceiling that makes
+        Task queries fail, and re-admitting them here would work against that. Bulk2
+        has no such special case and always queries everything, so on that path Task
+        gets the exemption like any other stream. The exemption follows what the
+        transport will actually do rather than the stream's name.
+        """
+        stream = catalog_entry["stream"]
+        conditions = self._parse_object_conditions(self.pull_config_objects, stream)
+        if not conditions:
+            return None
+
+        self._validate_row_filter(stream, conditions)
+
+        row_filter = f"({conditions})"
+        if self._soft_deletes_visible(stream) and "IsDeleted" in catalog_entry.get("schema", {}).get("properties", {}):
+            row_filter = f"({row_filter} OR IsDeleted = true)"
+        return row_filter
+
+    def _soft_deletes_visible(self, stream):
+        """Whether the transport for this stream returns soft-deleted rows at all."""
+        if stream.lower() != "task":
+            return True
+        return self.effective_api_type(stream) == BULK2_API_TYPE
+
+    def assert_row_filter_usable(self, catalog_entry):
+        """Resolve this stream's row filter and discard it, raising if it is unusable.
+
+        Callers that create state on Salesforce's side before they build their query
+        use this to fail first -- see ``Bulk._bulk_query``. The result is discarded on
+        purpose; the query builder resolves it again when it needs the text.
+        """
+        self.get_row_filter(catalog_entry)
+
+    def has_row_filter(self, catalog_entry):
+        """Whether the pull config carries a row filter for this stream.
+
+        Reports presence without resolving or validating, so a caller using it as a
+        plain predicate -- the empty-window bookmark guard in sync.py -- cannot have a
+        config error surface as a state bug.
+        """
+        return self._parse_object_conditions(self.pull_config_objects, catalog_entry["stream"]) is not None
 
     # pylint: disable=anomalous-backslash-in-string,line-too-long
     def check_rest_quota_usage(self, headers):
@@ -649,15 +804,27 @@ class Salesforce:
         catalog_metadata = metadata.to_map(catalog_entry["metadata"])
         replication_key = catalog_metadata.get((), {}).get("replication-key")
 
+        # The tenant's per-object row filter, if it has one. It goes after the date
+        # window and before ORDER BY -- appending it past the ORDER BY is a syntax
+        # error. Unlike the legacy puller, it is applied whether or not there is a
+        # date window: there, a pull with no date range emits a bare unfiltered SELECT,
+        # which is a divergence not worth inheriting.
+        row_filter = self.get_row_filter(catalog_entry)
+        row_filter_clause = f" AND {row_filter}" if row_filter else ""
+
         if replication_key:
             where_clause = f" WHERE {replication_key} >= {start_date} "
             end_date_clause = f" AND {replication_key} < {end_date}" if end_date else ""
 
             order_by = f" ORDER BY {replication_key} ASC"
             if order_by_clause:
-                return query + where_clause + end_date_clause + order_by
+                return query + where_clause + end_date_clause + row_filter_clause + order_by
 
-            return query + where_clause + end_date_clause
+            return query + where_clause + end_date_clause + row_filter_clause
+        elif row_filter:
+            # No replication key means no WHERE clause to extend, so the filter brings
+            # its own. Full-table streams take this arm.
+            return f"{query} WHERE {row_filter}"
         else:
             return query
 
