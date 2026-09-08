@@ -18,6 +18,7 @@ Run with:
 """
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -295,11 +296,51 @@ class TestFilterGuard:
         with pytest.raises(TapSalesforceExceptionError):
             sf.get_row_filter(make_catalog_entry("Lead"))
 
-    def test_over_length_filter_raises(self):
-        sf = make_sf(objects_config("Lead", "(" + "a = 1 AND " * 200 + "b = 1)"))
+    def test_over_length_filter_is_used_with_a_warning(self, caplog):
+        """The real cap lives in the config service, so raising it there must not stop a run.
 
-        with pytest.raises(TapSalesforceExceptionError, match="over the 1000 character limit"):
+        An over-long filter is a request-size risk rather than a wrong one, so the tap
+        says so and proceeds instead of stopping the tenant's extract on a constant it
+        does not own.
+        """
+        conditions = "(" + "a = 1 AND " * 200 + "b = 1)"
+        sf = make_sf(objects_config("Lead", conditions))
+
+        with caplog.at_level(logging.WARNING):
+            row_filter = sf.get_row_filter(make_catalog_entry("Lead"))
+
+        assert conditions in row_filter
+        assert "over the 1000" in caplog.text
+
+    @pytest.mark.parametrize("separator", [" ", "\t", "\n", "  "])
+    def test_a_subquery_is_caught_whatever_separates_it(self, separator):
+        """The keyword is matched on a word boundary, not against a hardcoded space."""
+        sf = make_sf(objects_config("Lead", f"Id IN (SELECT{separator}AccountId FROM Opportunity)"))
+
+        with pytest.raises(TapSalesforceExceptionError, match="subquery"):
             sf.get_row_filter(make_catalog_entry("Lead"))
+
+    @pytest.mark.parametrize(
+        "conditions",
+        ["a = 'x", "a = 'x' AND b = 'y", "a = 'unterminated"],
+    )
+    def test_an_unterminated_quoted_value_is_caught(self, conditions):
+        """The shape of the real incident, and the one a token scan alone misses.
+
+        With the literal unclosed, everything after it reads as part of the value, so
+        the rest of the predicate cannot be checked at all -- refusing is the only
+        honest answer.
+        """
+        sf = make_sf(objects_config("Lead", conditions))
+
+        with pytest.raises(TapSalesforceExceptionError, match="unterminated quoted value"):
+            sf.get_row_filter(make_catalog_entry("Lead"))
+
+    def test_masking_cannot_fuse_two_values_into_a_forbidden_token(self):
+        """Literals mask to a space, so neighbours cannot join into `--` or `/*`."""
+        sf = make_sf(objects_config("Lead", "a = 'x' AND b = 'y'"))
+
+        assert sf.get_row_filter(make_catalog_entry("Lead")) is not None
 
     def test_the_run_stops_rather_than_extracting_unfiltered(self):
         """The whole point: a broken filter must not become "no filter"."""
@@ -319,7 +360,7 @@ class TestEmptyFilteredWindow:
     @staticmethod
     def _sync(sf, entry, records, state):
         with metrics.record_counter(entry["stream"]) as counter, \
-                patch.object(Salesforce, "query", return_value=iter(records), create=True), \
+                patch.object(Salesforce, "query", return_value=iter(records)), \
                 patch("tap_salesforce.sync.tap_output.write_record"), \
                 patch("tap_salesforce.sync.tap_output.write_state"), \
                 patch("tap_salesforce.sync.tap_output.write_message"):
@@ -495,3 +536,118 @@ class TestErrorCodeExtraction:
             list(rest._query_recur("SELECT Id FROM Lead", make_catalog_entry("Lead"), "2024-01-01T00:00:00Z"))
 
         assert sync_records_mock.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# The REST retry paths
+# ---------------------------------------------------------------------------
+
+class TestFilterSurvivesEveryRestRebuild:
+    """rest.py rebuilds its query four times over; each rebuild must keep the filter.
+
+    The initial window, the forward continuation after a chunked window, the
+    partial-pagination resume, and the bisected half all call _build_query_string
+    again. A rebuild that dropped the filter would read one sub-window unfiltered and
+    ingest the excluded cohort for that range, with no error and nothing in the logs --
+    the exact failure the filter exists to prevent, in the one place it would not show.
+    """
+
+    @staticmethod
+    def _too_large():
+        from requests.exceptions import HTTPError
+
+        response = MagicMock()
+        response.json.return_value = [{"errorCode": "OPERATION_TOO_LARGE", "message": "too big"}]
+        return HTTPError(response=response)
+
+    def _run(self, pages):
+        """Drive Rest._query_recur, returning every query string it issued.
+
+        `pages` is one entry per call to _sync_records: a list of records to yield, or
+        an exception to raise after yielding them.
+        """
+        from tap_salesforce.salesforce.rest import Rest
+
+        sf = make_sf(objects_config("Lead", FILTER_LEADSOURCE))
+        sf.auth = MagicMock(rest_headers={})
+        issued = []
+        calls = {"n": 0}
+
+        def fake_sync_records(_self, _url, _headers, params):
+            issued.append(params["q"])
+            index = min(calls["n"], len(pages) - 1)
+            calls["n"] += 1
+            records, error = pages[index]
+            yield from records
+            if error is not None:
+                raise error
+
+        with patch.object(Rest, "_sync_records", fake_sync_records):
+            entry = make_catalog_entry("Lead")
+            start = "2024-01-01T00:00:00Z"
+            query = sf._build_query_string(entry, start)
+            list(Rest(sf)._query_recur(query, entry, start))
+
+        return issued
+
+    def test_the_bisected_half_carries_the_filter(self):
+        """No records yielded before the error, so the window is halved and rebuilt."""
+        issued = self._run([([], self._too_large()), ([], None)])
+
+        assert len(issued) > 1
+        assert all(FILTER_LEADSOURCE in query for query in issued)
+
+    def test_the_partial_pagination_resume_carries_the_filter(self):
+        """Records already streamed, so it resumes from the last one instead of bisecting."""
+        record = {"Id": "00Q1", "IsDeleted": False, "SystemModstamp": "2024-02-01T00:00:00.000000Z"}
+        issued = self._run([([record], self._too_large()), ([], None)])
+
+        assert len(issued) > 1
+        assert any("2024-02-01T00:00:00.000000Z" in query for query in issued)
+        assert all(FILTER_LEADSOURCE in query for query in issued)
+
+    def test_every_rebuild_keeps_the_soft_delete_exemption_too(self):
+        """The rebuilt query must match the first one, not a bare predicate."""
+        issued = self._run([([], self._too_large()), ([], None)])
+
+        assert all(emitted(FILTER_LEADSOURCE) in query for query in issued)
+
+
+class TestObjectsConfigIsParsedOnce:
+    """The query builder rebuilds its query many times; the config is parsed once."""
+
+    def test_repeated_query_builds_reuse_the_parsed_config(self):
+        """Both the field list and the row filter read it, on every rebuild."""
+        sf = make_sf(json.dumps(objects_config("Lead", FILTER_LEADSOURCE)))
+        entry = make_catalog_entry("Lead")
+
+        with patch("tap_salesforce.salesforce.json.loads", wraps=json.loads) as loads:
+            for _ in range(5):
+                sf._build_query_string(entry, "2024-01-01T00:00:00Z")
+
+        assert loads.call_count == 1
+
+    def test_a_broken_config_is_still_a_warning_not_a_crash(self):
+        """And the failed parse is cached too, rather than retried on every rebuild."""
+        sf = make_sf("{not json")
+
+        with patch("tap_salesforce.salesforce.json.loads", wraps=json.loads) as loads:
+            assert sf._parse_objects_config(sf.pull_config_objects, "Lead") == []
+            assert sf._parse_object_conditions(sf.pull_config_objects, "Lead") is None
+
+        assert loads.call_count == 1
+
+
+class TestHasRowFilterDoesNotValidate:
+    """The bookmark guard uses this as a plain predicate, so it must not raise."""
+
+    def test_an_unusable_filter_still_answers_true(self):
+        """A config error must surface from the query builder, not the bookmark guard."""
+        sf = make_sf(objects_config("Lead", "a = 1; DROP TABLE x"))
+
+        assert sf.has_row_filter(make_catalog_entry("Lead")) is True
+
+    def test_no_filter_answers_false(self):
+        sf = make_sf(objects_config("Lead"))
+
+        assert sf.has_row_filter(make_catalog_entry("Lead")) is False

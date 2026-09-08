@@ -34,15 +34,22 @@ BULK_API_TYPE = "BULK"
 BULK2_API_TYPE = "BULK2"
 REST_API_TYPE = "REST"
 
-# Bounds on the per-object row filter arriving in the pull config. mk-data-api parses
-# and re-emits the predicate before it gets here, so these are a backstop against a
-# defect on that path rather than the primary validation. The length bound matches the
-# one enforced there; the tokens are things no predicate needs and every injection
-# attempt wants.
+# A syntactic tripwire on the per-object row filter, not a validator. mk-data-api
+# parses the predicate and re-emits it from a grammar before it gets here, and that
+# remains the contract; these checks exist only to make a defect on that path loud
+# rather than to police free text the tap does not own.
+#
+# Length is advisory. The real cap lives in mk-data-api, and raising it there must not
+# stop a tenant's extract here, so an over-long filter is logged and used: it is a
+# request-size risk, not a correctness one.
 MAX_ROW_FILTER_LENGTH = 1000
-FORBIDDEN_ROW_FILTER_TOKENS = (";", "--", "/*", "SELECT ")
-# Matches a SOQL single-quoted literal, escapes included, so the check above can look
-# at a predicate's syntax without reading the values inside it.
+# Punctuation that never appears in a predicate outside a quoted value.
+FORBIDDEN_ROW_FILTER_TOKENS = (";", "--", "/*")
+# Matched on a word boundary rather than as a substring, so a subquery separated by a
+# tab or a newline cannot slip past a hardcoded space.
+FORBIDDEN_ROW_FILTER_KEYWORDS = re.compile(r"\bSELECT\b")
+# A SOQL single-quoted literal, escapes included. Masked out before the checks above
+# so they read a predicate's syntax without reading the values inside it.
 QUOTED_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'")
 
 STRING_TYPES = {
@@ -306,19 +313,38 @@ class Salesforce:
                 default_start_date,
             )
 
+    def _object_config_list(self, objects_config: str | list[dict]) -> list:
+        """Parse the objects config, once per instance.
+
+        The config does not change during a run, but the query builder rebuilds its
+        query on every REST bisection step and every resume, and both the field list
+        and the row filter read it. Parsing it each time re-walks a document carrying
+        every selected field name for every object.
+        """
+        cached = getattr(self, "_objects_config_cache", None)
+        if cached is not None and cached[0] is objects_config:
+            return cached[1]
+
+        try:
+            parsed = json.loads(objects_config) if isinstance(objects_config, str) else objects_config
+        except (json.JSONDecodeError, TypeError) as e:
+            LOGGER.warning(f"Failed to parse OBJECTS configuration: {e}")
+            parsed = []
+
+        self._objects_config_cache = (objects_config, parsed)
+        return parsed
+
     def _find_object_config(self, objects_config: str | list[dict], stream: str) -> dict | None:
         """Find the pull-config entry for the given stream, or None."""
         if not objects_config or not stream:
             return None
 
         try:
-            objects_list = json.loads(objects_config) if isinstance(objects_config, str) else objects_config
-
-            for obj in objects_list:
+            for obj in self._object_config_list(objects_config):
                 if isinstance(obj, dict) and obj.get('name', '').lower() == stream.lower():
                     return obj
             return None
-        except (json.JSONDecodeError, TypeError, KeyError) as e:
+        except (TypeError, KeyError) as e:
             LOGGER.warning(f"Failed to parse OBJECTS configuration: {e}")
             return None
 
@@ -351,21 +377,37 @@ class Salesforce:
         came back, so the next run re-reads the same window with no gap.
         """
         if len(conditions) > MAX_ROW_FILTER_LENGTH:
-            raise TapSalesforceExceptionError(
-                f"Row filter for {stream} is {len(conditions)} characters, "
-                f"over the {MAX_ROW_FILTER_LENGTH} character limit"
+            LOGGER.warning(
+                "Row filter for %s is %d characters, over the %d the tap expects. Using it anyway: "
+                "the limit belongs to the config service, and a longer filter is a request-size "
+                "risk rather than a wrong one.",
+                stream,
+                len(conditions),
+                MAX_ROW_FILTER_LENGTH,
             )
-        # Quoted values are blanked out first. These tokens are only dangerous as
+
+        # Quoted values are masked to a space first. These tokens are only dangerous as
         # syntax; inside a literal they are ordinary data, and companies really are
         # called things like "Select Comfort" or "Smith--Jones". Scanning the raw text
-        # would reject a filter the config service had already approved.
-        syntax = QUOTED_LITERAL.sub("''", conditions).upper()
+        # would reject a filter the config service had already approved. A space rather
+        # than an empty string so masking cannot fuse two neighbours into a new token.
+        syntax = QUOTED_LITERAL.sub(" ", conditions).upper()
+        if "'" in syntax:
+            raise TapSalesforceExceptionError(
+                f"Row filter for {stream} has an unterminated quoted value, "
+                "so the rest of the predicate cannot be read"
+            )
         for forbidden in FORBIDDEN_ROW_FILTER_TOKENS:
             if forbidden in syntax:
                 raise TapSalesforceExceptionError(
                     f"Row filter for {stream} contains {forbidden!r} outside a quoted value, "
                     "which is not a valid predicate"
                 )
+        if FORBIDDEN_ROW_FILTER_KEYWORDS.search(syntax):
+            raise TapSalesforceExceptionError(
+                f"Row filter for {stream} contains a subquery outside a quoted value, "
+                "which is not a valid predicate"
+            )
 
     def get_row_filter(self, catalog_entry):
         """Build the SOQL predicate to AND onto this stream's query, or None.
@@ -406,17 +448,23 @@ class Salesforce:
             return True
         return self.effective_api_type(stream) == BULK2_API_TYPE
 
-    def validate_row_filter(self, catalog_entry):
-        """Resolve this stream's row filter, raising if it is unusable.
+    def assert_row_filter_usable(self, catalog_entry):
+        """Resolve this stream's row filter and discard it, raising if it is unusable.
 
         Callers that create state on Salesforce's side before they build their query
-        use this to fail first -- see ``Bulk._bulk_query``.
+        use this to fail first -- see ``Bulk._bulk_query``. The result is discarded on
+        purpose; the query builder resolves it again when it needs the text.
         """
         self.get_row_filter(catalog_entry)
 
     def has_row_filter(self, catalog_entry):
-        """Whether this stream's query is narrowed by a row filter."""
-        return self.get_row_filter(catalog_entry) is not None
+        """Whether the pull config carries a row filter for this stream.
+
+        Reports presence without resolving or validating, so a caller using it as a
+        plain predicate -- the empty-window bookmark guard in sync.py -- cannot have a
+        config error surface as a state bug.
+        """
+        return self._parse_object_conditions(self.pull_config_objects, catalog_entry["stream"]) is not None
 
     # pylint: disable=anomalous-backslash-in-string,line-too-long
     def check_rest_quota_usage(self, headers):

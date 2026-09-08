@@ -134,7 +134,7 @@ class Bulk:
         # stream cannot use would otherwise raise with a job already open and nothing
         # left to close it -- once per scheduled run, until the org's job quota is
         # gone. Bulk2 gets this ordering for free by building its query before the POST.
-        self.sf.validate_row_filter(catalog_entry)
+        self.sf.assert_row_filter_usable(catalog_entry)
 
         job_id = self._create_job(catalog_entry)
         start_date = self.sf.get_start_date(state, catalog_entry)
