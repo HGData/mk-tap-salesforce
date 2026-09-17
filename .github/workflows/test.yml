@@ -14,6 +14,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install pytest pytest-mock requests simple_salesforce
+        # Install the tap itself so the tests run against its declared dependencies
+        # rather than a hand-listed subset. The old list omitted singer-python and
+        # xmltodict, which every module outside credentials.py imports.
+        run: pip install -e . pytest pytest-mock
       - name: Run tests
-        run: pytest tests/test_credentials.py -v
+        run: pytest tests/test_credentials.py tests/test_row_filter.py -v

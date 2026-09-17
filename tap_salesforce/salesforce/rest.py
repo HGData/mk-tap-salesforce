@@ -14,6 +14,36 @@ LOGGER = singer.get_logger()
 MAX_RETRIES = 8
 
 
+def _error_code(response, stream):
+    """Best-effort extraction of the Salesforce errorCode from an error response.
+
+    Returns None when the body is not a Salesforce error at all. An over-long request
+    line comes back from the proxy as HTML rather than JSON, and parsing that inside
+    the handler below would raise from within an except block and bury the error that
+    actually happened. That matters most for the one failure a row filter can cause on
+    its own: the query travels as a URL parameter, so a filter is one of the few things
+    that can push a request past the size limit.
+
+    Mirrors the helper of the same name in bulk.py.
+    """
+    try:
+        body = response.json()
+    except (ValueError, AttributeError):
+        LOGGER.warning(
+            "Salesforce returned a non-JSON error body for %s (HTTP %s, %d bytes); "
+            "surfacing the original error rather than a parse failure",
+            stream,
+            getattr(response, "status_code", "unknown"),
+            len(response.content or b""),
+        )
+        return None
+    if isinstance(body, list) and body and isinstance(body[0], dict):
+        return body[0].get("errorCode")
+    if isinstance(body, dict):
+        return body.get("errorCode")
+    return None
+
+
 class Rest:
     def __init__(self, sf):
         self.sf = sf
@@ -71,8 +101,19 @@ class Rest:
                     yield record
 
         except HTTPError as ex:
-            response = ex.response.json()
-            if isinstance(response, list) and response[0].get("errorCode") in ("QUERY_TIMEOUT", "OPERATION_TOO_LARGE"):
+            error_code = _error_code(ex.response, catalog_entry["stream"])
+            if error_code == "MALFORMED_QUERY":
+                # Not retryable and not bisectable: the query is wrong, not too big.
+                # Named explicitly because a rejected row filter lands here, and
+                # Salesforce's text for it ("unexpected token") matches none of the
+                # patterns the pull-side error classifier knows.
+                LOGGER.error(
+                    "Salesforce rejected the query for %s as malformed. If this stream carries a row "
+                    "filter, that predicate is the first thing to check.",
+                    catalog_entry["stream"],
+                )
+                raise ex
+            if error_code in ("QUERY_TIMEOUT", "OPERATION_TOO_LARGE"):
                 start_date = singer_utils.strptime_with_tz(start_date_str)
                 total_seconds = (end_date - start_date).total_seconds()
                 end_date_str = singer_utils.strftime(end_date)
@@ -82,7 +123,7 @@ class Rest:
                     range_label = f"{total_seconds / 3600:.1f} hours"
                 LOGGER.info(
                     "Salesforce returned %s querying %s of %s (range: %s to %s) — bisecting date range",
-                    response[0].get("errorCode"),
+                    error_code,
                     range_label,
                     catalog_entry["stream"],
                     start_date_str,
