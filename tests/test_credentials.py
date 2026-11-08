@@ -248,6 +248,18 @@ class TestRefreshAccessToken:
         assert ping_auth == _BONGO_AUTH, f"Expected {_BONGO_AUTH}, got {ping_auth}"
         assert argo_auth == _ARGO_AUTH,  f"Expected {_ARGO_AUTH}, got {argo_auth}"
 
+    def test_both_requests_identify_the_caller(self):
+        auth = _make_auth()
+        with patch.dict("os.environ", BONGO_ENV), \
+             patch("requests.get") as mock_get, \
+             patch.object(threading.Timer, "start"):
+            mock_get.side_effect = [_mock_resp({"tested": True}), _argo_creds("AT2")]
+            auth.refresh_access_token()
+
+        assert mock_get.call_count == 2
+        for call in mock_get.call_args_list:
+            assert call[1]["headers"]["x-mk-caller"] == "mdi-tap-salesforce"
+
     def test_ping_tested_false_logs_warning_but_still_reads_argo(self, caplog):
         """tested=false is an unlikely bongo non-failure — warn but still read from Argo."""
         auth = _make_auth()
