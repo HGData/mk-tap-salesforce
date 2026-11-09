@@ -23,6 +23,8 @@ _ARGO_MODE_REQUIRED = (
     "BONGO_API_BASIC_AUTH_USERNAME",
 )
 
+_MK_CALLER = "mdi-tap-salesforce"
+
 
 def parse_credentials(config):
     # Argo mode: all credentials come from Argo/bongo at runtime.
@@ -186,7 +188,7 @@ class SalesforceAuthOAuth(SalesforceAuth):
         LOGGER.info("SF RTR: calling bongo ping event=bongo_ping_started tenant=%s", tenant)
         resp = requests.get(
             f"{bongo_url}/v1/org/{tenant}/integrations/salesforce/ping",
-            headers={"Authorization": bongo_auth},
+            headers={"Authorization": bongo_auth, "x-mk-caller": _MK_CALLER},
             timeout=60,  # bongo may need to wait for the Argo lock + call SF
         )
         resp.raise_for_status()
@@ -236,7 +238,7 @@ class SalesforceAuthOAuth(SalesforceAuth):
         """GET current connector credentials from Argo."""
         resp = requests.get(
             f"{argo_url}/v1/tenant/{tenant}/connectors/salesforce",
-            headers={"Authorization": self._argo_auth()},
+            headers={"Authorization": self._argo_auth(), "x-mk-caller": _MK_CALLER},
             timeout=10,
         )
         resp.raise_for_status()
